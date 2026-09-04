@@ -24,3 +24,7 @@ debug_hh/
 state.json
 storage_state.json
 backups/agent-backup.db
+# Temporary/debug artifacts
+debug_*.html
+debug_*.png
+*.bak
