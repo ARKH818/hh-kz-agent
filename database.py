@@ -1838,6 +1838,8 @@ class Database:
                 return None
             if telegram_user_id != expected_user_id:
                 return None
+            if row["telegram_user_id"] is not None and row["telegram_user_id"] != telegram_user_id:
+                return None
             permit = secrets.token_urlsafe(32)
             permit_hash = hashlib.sha256(permit.encode()).hexdigest()
             cursor = connection.execute(
@@ -1862,6 +1864,8 @@ class Database:
     def skip(self, job_id: str, telegram_user_id: int, expected_user_id: int) -> bool:
         if telegram_user_id != expected_user_id:
             return False
+            if row["telegram_user_id"] is not None and row["telegram_user_id"] != telegram_user_id:
+                return None
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
@@ -2025,8 +2029,15 @@ class Database:
         if telegram_user_id is not None:
             return int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM vacancies WHERE status = ? AND applied_at >= ? AND applied_at < ? AND (telegram_user_id = ? OR telegram_user_id IS NULL)",
-                    (VacancyStatus.APPLIED.value, start, end, telegram_user_id),
+                    """
+                    SELECT COUNT(*) FROM vacancies
+                    WHERE (
+                        telegram_user_id = ?
+                        OR (telegram_user_id IS NULL AND approver_id = ?)
+                    )
+                    AND status = ? AND applied_at >= ? AND applied_at < ?
+                    """,
+                    (telegram_user_id, telegram_user_id, VacancyStatus.APPLIED.value, start, end),
                 ).fetchone()[0]
             )
         return int(
@@ -2043,14 +2054,18 @@ class Database:
                 connection.execute(
                     """
                     SELECT COUNT(*) FROM vacancies
-                    WHERE (telegram_user_id = ? OR telegram_user_id IS NULL)
-                      AND (
+                    WHERE (
+                        telegram_user_id = ?
+                        OR (telegram_user_id IS NULL AND approver_id = ?)
+                    )
+                    AND (
                         (status = ? AND applied_at >= ? AND applied_at < ?)
                         OR (status = ? AND applying_at >= ? AND applying_at < ?)
                         OR (status IN (?, ?) AND submit_attempted_at >= ? AND submit_attempted_at < ?)
-                      )
+                    )
                     """,
                     (
+                        telegram_user_id,
                         telegram_user_id,
                         VacancyStatus.APPLIED.value,
                         start,
@@ -2146,7 +2161,7 @@ class Database:
         with self._connect() as connection:
             if telegram_user_id is not None:
                 for row in connection.execute(
-                    "SELECT status, COUNT(*) AS count FROM vacancies WHERE telegram_user_id = ? OR telegram_user_id IS NULL GROUP BY status",
+                    "SELECT status, COUNT(*) AS count FROM vacancies WHERE telegram_user_id = ? GROUP BY status",
                     (telegram_user_id,),
                 ):
                     counts[row["status"]] = row["count"]

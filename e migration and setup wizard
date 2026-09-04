@@ -1,0 +1,345 @@
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/.gitignore b/.gitignore[m
+[1mindex f0175d2..8dc66d6 100644[m
+[1m--- a/.gitignore[m
+[1m+++ b/.gitignore[m
+[36m@@ -19,3 +19,8 @@[m [m__pycache__/[m
+ [m
+ backups/[m
+ debug_hh/[m
+[32m+[m[32m.browser-profile/[m
+[32m+[m[32m.browser-profile.backup/[m
+[32m+[m[32mstate.json[m
+[32m+[m[32mstorage_state.json[m
+[32m+[m[32mbackups/agent-backup.db[m
+\ No newline at end of file[m
+[1mdiff --git a/database.py b/database.py[m
+[1mindex ad08f36..d044e63 100644[m
+[1m--- a/database.py[m
+[1m+++ b/database.py[m
+[36m@@ -49,6 +49,7 @@[m [mclass Vacancy:[m
+     applied_at: str | None[m
+     approver_id: int | None[m
+     error_text: str[m
+[32m+[m[32m    cover_letter: str[m
+ [m
+ [m
+ @dataclass(frozen=True)[m
+[36m@@ -174,7 +175,8 @@[m [mclass Database:[m
+                     applied_at TEXT,[m
+                     approver_id INTEGER,[m
+                     permit_hash TEXT,[m
+[31m-                    error_text TEXT NOT NULL DEFAULT ''[m
+[32m+[m[32m                    error_text TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    cover_letter TEXT NOT NULL DEFAULT ''[m
+                 )[m
+                 """[m
+             )[m
+[36m@@ -239,6 +241,265 @@[m [mclass Database:[m
+                 """[m
+             )[m
+ [m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE TABLE IF NOT EXISTS user_profiles ([m
+[32m+[m[32m                    telegram_user_id INTEGER PRIMARY KEY,[m
+[32m+[m[32m                    name TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    location TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    experience_summary TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    education TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    github_url TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    salary_expectation TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    additional_information TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    created_at TEXT NOT NULL,[m
+[32m+[m[32m                    updated_at TEXT NOT NULL,[m
+[32m+[m[32m                    FOREIGN KEY (telegram_user_id)[m
+[32m+[m[32m                        REFERENCES users(telegram_user_id)[m
+[32m+[m[32m                        ON DELETE CASCADE[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE TABLE IF NOT EXISTS search_profiles ([m
+[32m+[m[32m                    id INTEGER PRIMARY KEY AUTOINCREMENT,[m
+[32m+[m[32m                    telegram_user_id INTEGER NOT NULL,[m
+[32m+[m[32m                    name TEXT NOT NULL,[m
+[32m+[m[32m                    enabled INTEGER NOT NULL DEFAULT 1,[m
+[32m+[m
+[32m+[m[32m                    search_queries_json TEXT NOT NULL DEFAULT '[]',[m
+[32m+[m[32m                    areas_json TEXT NOT NULL DEFAULT '[]',[m
+[32m+[m[32m                    experience_filters_json TEXT NOT NULL DEFAULT '[]',[m
+[32m+[m[32m                    desired_positions_json TEXT NOT NULL DEFAULT '[]',[m
+[32m+[m[32m                    technologies_json TEXT NOT NULL DEFAULT '[]',[m
+[32m+[m[32m                    excluded_positions_json TEXT NOT NULL DEFAULT '[]',[m
+[32m+[m[32m                    work_format_json TEXT NOT NULL DEFAULT '[]',[m
+[32m+[m
+[32m+[m[32m                    min_salary INTEGER,[m
+[32m+[m
+[32m+[m[32m                    created_at TEXT NOT NULL,[m
+[32m+[m[32m                    updated_at TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (telegram_user_id)[m
+[32m+[m[32m                        REFERENCES users(telegram_user_id)[m
+[32m+[m[32m                        ON DELETE CASCADE[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE INDEX IF NOT EXISTS search_profiles_user_idx[m
+[32m+[m[32m                ON search_profiles(telegram_user_id, enabled)[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE TABLE IF NOT EXISTS hh_accounts ([m
+[32m+[m[32m                    id INTEGER PRIMARY KEY AUTOINCREMENT,[m
+[32m+[m[32m                    telegram_user_id INTEGER NOT NULL UNIQUE,[m
+[32m+[m
+[32m+[m[32m                    account_label TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    status TEXT NOT NULL DEFAULT 'disconnected',[m
+[32m+[m
+[32m+[m[32m                    browser_profile_dir TEXT NOT NULL DEFAULT '',[m
+[32m+[m
+[32m+[m[32m                    last_login_at TEXT,[m
+[32m+[m[32m                    last_checked_at TEXT,[m
+[32m+[m[32m                    last_error TEXT NOT NULL DEFAULT '',[m
+[32m+[m
+[32m+[m[32m                    created_at TEXT NOT NULL,[m
+[32m+[m[32m                    updated_at TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (telegram_user_id)[m
+[32m+[m[32m                        REFERENCES users(telegram_user_id)[m
+[32m+[m[32m                        ON DELETE CASCADE[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE TABLE IF NOT EXISTS resumes ([m
+[32m+[m[32m                    id INTEGER PRIMARY KEY AUTOINCREMENT,[m
+[32m+[m[32m                    telegram_user_id INTEGER NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    hh_resume_id TEXT NOT NULL,[m
+[32m+[m[32m                    title TEXT NOT NULL DEFAULT '',[m
+[32m+[m
+[32m+[m[32m                    is_active INTEGER NOT NULL DEFAULT 1,[m
+[32m+[m
+[32m+[m[32m                    last_raised_at TEXT,[m
+[32m+[m[32m                    next_raise_at TEXT,[m
+[32m+[m[32m                    raise_interval_minutes INTEGER,[m
+[32m+[m
+[32m+[m[32m                    last_error TEXT NOT NULL DEFAULT '',[m
+[32m+[m
+[32m+[m[32m                    created_at TEXT NOT NULL,[m
+[32m+[m[32m                    updated_at TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    UNIQUE(telegram_user_id, hh_resume_id),[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (telegram_user_id)[m
+[32m+[m[32m                        REFERENCES users(telegram_user_id)[m
+[32m+[m[32m                        ON DELETE CASCADE[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE INDEX IF NOT EXISTS resumes_raise_idx[m
+[32m+[m[32m                ON resumes(is_active, next_raise_at)[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE TABLE IF NOT EXISTS user_vacancies ([m
+[32m+[m[32m                    id INTEGER PRIMARY KEY AUTOINCREMENT,[m
+[32m+[m
+[32m+[m[32m                    telegram_user_id INTEGER NOT NULL,[m
+[32m+[m[32m                    vacancy_id TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    search_profile_id INTEGER,[m
+[32m+[m
+[32m+[m[32m                    match_status TEXT NOT NULL DEFAULT 'matched',[m
+[32m+[m
+[32m+[m[32m                    seen_at TEXT,[m
+[32m+[m[32m                    matched_at TEXT NOT NULL,[m
+[32m+[m[32m                    created_at TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    UNIQUE(telegram_user_id, vacancy_id),[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (telegram_user_id)[m
+[32m+[m[32m                        REFERENCES users(telegram_user_id)[m
+[32m+[m[32m                        ON DELETE CASCADE,[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (vacancy_id)[m
+[32m+[m[32m                        REFERENCES vacancies(id)[m
+[32m+[m[32m                        ON DELETE CASCADE,[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (search_profile_id)[m
+[32m+[m[32m                        REFERENCES search_profiles(id)[m
+[32m+[m[32m                        ON DELETE SET NULL[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE INDEX IF NOT EXISTS user_vacancies_user_idx[m
+[32m+[m[32m                ON user_vacancies(telegram_user_id, matched_at)[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE TABLE IF NOT EXISTS applications ([m
+[32m+[m[32m                    id INTEGER PRIMARY KEY AUTOINCREMENT,[m
+[32m+[m
+[32m+[m[32m                    telegram_user_id INTEGER NOT NULL,[m
+[32m+[m[32m                    vacancy_id TEXT NOT NULL,[m
+[32m+[m[32m                    resume_id INTEGER,[m
+[32m+[m
+[32m+[m[32m                    status TEXT NOT NULL DEFAULT 'new',[m
+[32m+[m
+[32m+[m[32m                    response_url TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    cover_letter TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                    error_text TEXT NOT NULL DEFAULT '',[m
+[32m+[m
+[32m+[m[32m                    created_at TEXT NOT NULL,[m
+[32m+[m[32m                    applied_at TEXT,[m
+[32m+[m[32m                    updated_at TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    UNIQUE(telegram_user_id, vacancy_id),[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (telegram_user_id)[m
+[32m+[m[32m                        REFERENCES users(telegram_user_id)[m
+[32m+[m[32m                        ON DELETE CASCADE,[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (vacancy_id)[m
+[32m+[m[32m                        REFERENCES vacancies(id)[m
+[32m+[m[32m                        ON DELETE CASCADE,[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (resume_id)[m
+[32m+[m[32m                        REFERENCES resumes(id)[m
+[32m+[m[32m                        ON DELETE SET NULL[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE INDEX IF NOT EXISTS applications_user_status_idx[m
+[32m+[m[32m                ON applications([m
+[32m+[m[32m                    telegram_user_id,[m
+[32m+[m[32m                    status,[m
+[32m+[m[32m                    updated_at[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE TABLE IF NOT EXISTS application_events ([m
+[32m+[m[32m                    id INTEGER PRIMARY KEY AUTOINCREMENT,[m
+[32m+[m
+[32m+[m[32m                    application_id INTEGER NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    status TEXT NOT NULL,[m
+[32m+[m[32m                    message TEXT NOT NULL DEFAULT '',[m
+[32m+[m
+[32m+[m[32m                    created_at TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (application_id)[m
+[32m+[m[32m                        REFERENCES applications(id)[m
+[32m+[m[32m                        ON DELETE CASCADE[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE TABLE IF NOT EXISTS scheduled_tasks ([m
+[32m+[m[32m                    id INTEGER PRIMARY KEY AUTOINCREMENT,[m
+[32m+[m
+[32m+[m[32m                    telegram_user_id INTEGER NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    task_type TEXT NOT NULL,[m
+[32m+[m[32m                    payload_json TEXT NOT NULL DEFAULT '{}',[m
+[32m+[m
+[32m+[m[32m                    status TEXT NOT NULL DEFAULT 'pending',[m
+[32m+[m
+[32m+[m[32m                    run_at TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    locked_at TEXT,[m
+[32m+[m[32m                    completed_at TEXT,[m
+[32m+[m
+[32m+[m[32m                    last_error TEXT NOT NULL DEFAULT '',[m
+[32m+[m
+[32m+[m[32m                    created_at TEXT NOT NULL,[m
+[32m+[m[32m                    updated_at TEXT NOT NULL,[m
+[32m+[m
+[32m+[m[32m                    FOREIGN KEY (telegram_user_id)[m
+[32m+[m[32m                        REFERENCES users(telegram_user_id)[m
+[32m+[m[32m                        ON DELETE CASCADE[m
+[32m+[m[32m                )[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            connection.execute([m
+[32m+[m[32m                """[m
+[32m+[m[32m                CREATE INDEX IF NOT EXISTS scheduled_tasks_queue_idx[m
+[32m+[m[32m                ON scheduled_tasks(status, run_at)[m
+[32m+[m[32m                """[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m
+     def ensure_user([m
+         self,[m
+         telegram_user_id: int,[m
+[36m@@ -318,19 +579,68 @@[m [mclass Database:[m
+                 applied_at TEXT,[m
+                 approver_id INTEGER,[m
+                 permit_hash TEXT,[m
+[31m-                error_text TEXT NOT NULL DEFAULT ''[m
+[32m+[m[32m                error_text TEXT NOT NULL DEFAULT '',[m
+[32m+[m[32m                cover_letter TEXT NOT NULL DEFAULT ''[m
+             )[m
+             """[m
+         )[m
+[31m-        columns = ([m
+[31m-            "id, title, company, company_url, company_rating, company_reviews_count, "[m
+[31m-            "salary, schedule, location, experience, url, description_hash, search_query, "[m
+[31m-            "status, discovered_at, approval_requested_at, approval_expires_at, "[m
+[31m-            "approved_at, applied_at, approver_id, permit_hash, error_text, "[m
+[31m-            "applying_at, submit_attempted_at"[m
+[32m+[m[32m        old_columns = {[m
+[32m+[m[32m            row["name"][m
+[32m+[m[32m            for row in connection.execute([m
+[32m+[m[32m                "PRAGMA table_info(_vacancies_old)"[m
+[32m+[m[32m            ).fetchall()[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        def select_column(name: str, default_sql: str = "NULL") -> str:[m
+[32m+[m[32m            if name in old_columns:[m
+[32m+[m[32m                return name[m
+[32m+[m[32m            return f"{default_sql} AS {name}"[m
+[32m+[m
+[32m+[m[32m        insert_columns = ([m
+[32m+[m[32m            "id, title, company, company_url, company_rating, "[m
+[32m+[m[32m            "company_reviews_count, salary, schedule, location, experience, "[m
+[32m+[m[32m            "url, description_hash, search_query, status, discovered_at, "[m
+[32m+[m[32m            "approval_requested_at, approval_expires_at, approved_at, "[m
+[32m+[m[32m            "applying_at, submit_attempted_at, applied_at, approver_id, "[m
+[32m+[m[32m            "permit_hash, error_text, cover_letter"[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m        select_columns = ", ".join([m
+[32m+[m[32m            ([m
+[32m+[m[32m                select_column("id"),[m
+[32m+[m[32m                select_column("title"),[m
+[32m+[m[32m                select_co

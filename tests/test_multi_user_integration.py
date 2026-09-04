@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from approval import ApplicationPermission, ApprovalGuard
+from approval import ApplicationPermission, ApprovalGuard, ApprovalService
 from config import load_settings
 from database import Database, VacancyStatus
 from hh_client import HHClient
@@ -114,8 +114,9 @@ def _setup_vacancy_and_approve(
         description_hash="hash",
         search_query="Python",
         discovered_at=now,
+        telegram_user_id=telegram_user_id,
     )
-    database.request_approval(job_id=job_id, now=now)
+    database.request_approval(job_id=job_id, now=now, telegram_user_id=telegram_user_id)
     permit = database.approve(
         job_id=job_id,
         telegram_user_id=telegram_user_id,
@@ -502,3 +503,142 @@ def test_user_42_cannot_approve_user_43_vacancy(tmp_path: Path) -> None:
     )
     assert permit is None
     assert database.get("job-43").status is VacancyStatus.PENDING_APPROVAL
+
+
+# ============================================================================
+# ApprovalService isolation
+# ============================================================================
+
+def test_approval_service_user_42_cannot_apply_for_user_43(tmp_path: Path) -> None:
+    """ApprovalService.enforce user isolation: User 42 cannot trigger apply for User 43's vacancy."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    now = NOW
+
+    _setup_user_with_profile_and_resume(database, 42, "Resume FortyTwo", now)
+    _setup_user_with_profile_and_resume(database, 43, "Resume FortyThree", now)
+
+    # User 43's vacancy
+    database.discover(
+        job_id="job-43",
+        title="Job 43",
+        company="Test Co",
+        url="https://example.com/vacancy/job-43",
+        description_hash="hash",
+        search_query="Python",
+        discovered_at=now,
+        telegram_user_id=43,
+    )
+    database.request_approval(job_id="job-43", now=now, telegram_user_id=43)
+
+    # User 42 tries to approve_and_apply for User 43's vacancy
+    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    page = ResumeTrackingPage(expected_resume="Resume FortyThree")
+    client = HHClient(
+        FakeContext(page),
+        settings,
+        database,
+        guard,
+        sleep=lambda _: asyncio.sleep(0),
+        now_factory=lambda: now + timedelta(minutes=3),
+    )
+    service = ApprovalService(
+        settings,
+        database,
+        client,
+        now_factory=lambda: now + timedelta(minutes=1),
+    )
+
+    result = asyncio.run(service.approve_and_apply("job-43", 42))
+
+    assert not result.ok
+    assert database.get("job-43").status is VacancyStatus.PENDING_APPROVAL
+    assert database.get("job-43").approver_id is None
+    assert database.get("job-43").approved_at is None
+
+
+# ============================================================================
+# Database-level isolation: list operations
+# ============================================================================
+
+def test_user_vacancies_are_isolated_in_list_operations(tmp_path: Path) -> None:
+    """User-scoped list operations return only owned data."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    now = NOW
+
+    _setup_user_with_profile_and_resume(database, 42, "Resume FortyTwo", now)
+    _setup_user_with_profile_and_resume(database, 43, "Resume FortyThree", now)
+
+    # User 42 has a vacancy
+    database.discover(
+        job_id="job-42",
+        title="Job 42",
+        company="Test Co",
+        url="https://example.com/vacancy/job-42",
+        description_hash="hash",
+        search_query="Python",
+        discovered_at=now,
+        telegram_user_id=42,
+    )
+    database.request_approval(job_id="job-42", now=now, telegram_user_id=42)
+
+    # User 43 has a vacancy
+    database.discover(
+        job_id="job-43",
+        title="Job 43",
+        company="Test Co",
+        url="https://example.com/vacancy/job-43",
+        description_hash="hash",
+        search_query="Python",
+        discovered_at=now,
+        telegram_user_id=43,
+    )
+    database.request_approval(job_id="job-43", now=now, telegram_user_id=43)
+
+    # pending() is user-scoped
+    pending_42 = database.pending(telegram_user_id=42)
+    pending_43 = database.pending(telegram_user_id=43)
+
+    assert len(pending_42) == 1
+    assert pending_42[0].id == "job-42"
+    assert len(pending_43) == 1
+    assert pending_43[0].id == "job-43"
+
+    # stats() is user-scoped
+    stats_42 = database.stats(telegram_user_id=42)
+    stats_43 = database.stats(telegram_user_id=43)
+
+    assert stats_42["pending_approval"] == 1
+    assert stats_43["pending_approval"] == 1
+    # Each user sees only their own vacancy
+    assert stats_42.get("discovered", 0) == 0
+    assert stats_43.get("discovered", 0) == 0
+
+
+# ============================================================================
+# Daily limit isolation
+# ============================================================================
+
+def test_daily_limit_is_user_scoped(tmp_path: Path) -> None:
+    """Daily application limit is isolated per user."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    now = NOW
+
+    _setup_user_with_profile_and_resume(database, 42, "Resume FortyTwo", now)
+    _setup_user_with_profile_and_resume(database, 43, "Resume FortyThree", now)
+
+    # User 42 applies to a vacancy (completes full flow)
+    permit_42 = _setup_vacancy_and_approve(database, "job-42", 42, now)
+    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    claim_42 = guard.claim(ApplicationPermission("job-42", permit_42, 42))
+    assert claim_42.allowed
+    database.complete_application("job-42", permit_42, success=True, now=now + timedelta(minutes=3))
+
+    # User 43 should have their own independent daily limit
+    assert database.applied_today(now + timedelta(minutes=4), telegram_user_id=43) == 0
+    assert database.applied_today(now + timedelta(minutes=4), telegram_user_id=42) == 1
