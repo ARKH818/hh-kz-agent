@@ -10,8 +10,11 @@ from aiogram.types import InputRichBlockDetails, InputRichMessage
 
 from config import load_settings
 from database import Database
+from config import load_user_settings
+from runtime_context import create_runtime_context
 from tests.test_config import VALID_ENV, write_profile
-from tg_bot import AgentControl, TelegramService
+from tg_bot import TelegramService
+from updater import ReleaseInfo
 
 
 NOW = datetime(2026, 7, 26, 9, 0, tzinfo=UTC)
@@ -32,6 +35,23 @@ class FakeBot:
         self.messages.append(kwargs)
 
 
+class FakeUser:
+    def __init__(self, user_id: int, username: str | None = None, first_name: str | None = None):
+        self.id = user_id
+        self.username = username
+        self.first_name = first_name
+
+
+class FakeMessage:
+    def __init__(self, text: str, from_user: FakeUser):
+        self.text = text
+        self.from_user = from_user
+        self.answer_text: str | None = None
+
+    async def answer(self, text: str, **kwargs) -> None:
+        self.answer_text = text
+
+
 class FakeApprovalService:
     async def approve_and_apply(self, job_id: str, user_id: int):
         raise AssertionError("approval must not be called by command tests")
@@ -47,23 +67,23 @@ def service(
 ):
     settings = load_settings(
         profile_path=write_profile(tmp_path),
-        environ={**VALID_ENV, "TG_USER_ID": "42", "APP_MODE": app_mode},
+        environ={**VALID_ENV, "APP_MODE": app_mode},
     )
     settings = replace(settings, database_path=tmp_path / "agent.db")
     database = Database(settings.database_path)
     database.init()
     database.create_user(telegram_user_id=42, username="testuser42", now=NOW)
-    control = AgentControl()
+    context = create_runtime_context(42, settings, database, load_user_settings(settings))
     bot = FakeBot(rich_error)
     telegram = TelegramService(
         settings,
         database,
         FakeApprovalService(),
-        control,
+        contexts={42: context},
         bot=bot,
         now_factory=lambda: NOW,
     )
-    return telegram, database, control, bot
+    return telegram, database, context, bot
 
 
 def add_preview_vacancy(database: Database, telegram_user_id: int = 42) -> None:
@@ -110,34 +130,33 @@ def add_search_run(database: Database, telegram_user_id: int = 42) -> None:
 
 
 def test_foreign_user_cannot_pause_or_read_configuration(tmp_path: Path) -> None:
-    telegram, _, control, _ = service(tmp_path)
+    telegram, _, context, _ = service(tmp_path)
 
     reply = telegram.command("pause", user_id=99)
 
     assert reply == "This bot is private."
-    assert not control.paused
+    assert not context.paused
     assert "42" not in reply
-    assert "TG_USER_ID" not in reply
 
 
 def test_pause_resume_and_status_use_live_state(tmp_path: Path) -> None:
-    telegram, _, control, _ = service(tmp_path)
+    telegram, _, context, _ = service(tmp_path)
 
     assert telegram.command("pause", user_id=42) == "Agent paused."
-    assert control.paused
+    assert context.paused
     status = telegram.command("status", user_id=42)
     assert "mode: dry_run" in status
     assert "state: paused" in status
     assert telegram.command("resume", user_id=42) == "Agent resumed."
-    assert not control.paused
-    assert control.wake_event.is_set()
+    assert not context.paused
+    assert context.wake_event.is_set()
 
 
 def test_diagnostics_shows_last_search_run(tmp_path: Path) -> None:
-    telegram, database, control, _ = service(tmp_path)
+    telegram, database, context, _ = service(tmp_path)
     add_search_run(database)
-    control.circuit_reason = "technical_failure_ratio"
-    control.next_run_at = NOW + timedelta(minutes=30)
+    context.circuit_reason = "technical_failure_ratio"
+    context.next_run_at = NOW + timedelta(minutes=30)
 
     reply = telegram.command("diagnostics", user_id=42)
 
@@ -158,19 +177,19 @@ def test_diagnostics_shows_last_search_run(tmp_path: Path) -> None:
 def test_resume_clears_runtime_breaker_but_keeps_saved_diagnostics(
     tmp_path: Path,
 ) -> None:
-    telegram, database, control, _ = service(tmp_path)
+    telegram, database, context, _ = service(tmp_path)
     add_search_run(database)
-    control.paused = True
-    control.circuit_reason = "page_structure_changed"
-    control.consecutive_search_errors = 3
-    control.next_run_at = NOW + timedelta(minutes=30)
+    context.paused = True
+    context.circuit_reason = "page_structure_changed"
+    context.consecutive_search_errors = 3
+    context.next_run_at = NOW + timedelta(minutes=30)
 
     assert telegram.command("resume", 42) == "Agent resumed."
-    assert not control.paused
-    assert control.circuit_reason == ""
-    assert control.consecutive_search_errors == 0
-    assert control.next_run_at is None
-    assert control.wake_event.is_set()
+    assert not context.paused
+    assert context.circuit_reason == ""
+    assert context.consecutive_search_errors == 0
+    assert context.next_run_at is None
+    assert context.wake_event.is_set()
     assert database.latest_search_run(telegram_user_id=42).circuit_reason == "page_structure_changed"
     diagnostics = telegram.command("diagnostics", 42)
     assert "breaker: closed" in diagnostics
@@ -370,3 +389,260 @@ def test_notify_with_explicit_telegram_user_id(tmp_path: Path) -> None:
     assert len(bot.messages) == 1
     assert bot.messages[0]["chat_id"] == 42
     assert bot.messages[0]["text"] == "Test message"
+
+# ========== Tests for Stage 4.1 — Real Telegram user registration ==========
+
+
+def test_new_user_start_creates_user_in_db(tmp_path: Path) -> None:
+    """New Telegram user calling /start gets registered in users table."""
+    telegram, database, _, _ = service(tmp_path)
+
+    # User 99 does not exist yet
+    assert telegram.authorized(99) is False
+
+    # Simulate /start from user 99
+    user = FakeUser(user_id=99, username="john_doe", first_name="John")
+    message = FakeMessage(text="/start", from_user=user)
+    asyncio.run(telegram._command_handler(message))
+
+    # User now exists and is active
+    user_row = database.get_user(99)
+    assert user_row is not None
+    assert user_row["telegram_user_id"] == 99
+    assert user_row["is_active"] == 1
+    assert telegram.authorized(99) is True
+
+
+def test_new_user_start_saves_metadata(tmp_path: Path) -> None:
+    """Telegram username and first_name are saved during registration."""
+    telegram, database, _, _ = service(tmp_path)
+
+    user = FakeUser(user_id=99, username="john_doe", first_name="John")
+    message = FakeMessage(text="/start", from_user=user)
+    asyncio.run(telegram._command_handler(message))
+
+    user_row = database.get_user(99)
+    assert user_row["username"] == "john_doe"
+    assert user_row["first_name"] == "John"
+
+
+def test_repeated_start_does_not_create_duplicate(tmp_path: Path) -> None:
+    """Calling /start twice does not create duplicate users."""
+    telegram, database, _, _ = service(tmp_path)
+
+    user = FakeUser(user_id=99, username="john_doe", first_name="John")
+    message = FakeMessage(text="/start", from_user=user)
+
+    asyncio.run(telegram._command_handler(message))
+    asyncio.run(telegram._command_handler(message))
+
+    # Count users with id 99
+    with database._connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE telegram_user_id = ?", (99,)
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_start_updates_metadata_if_changed(tmp_path: Path) -> None:
+    """Repeated /start updates username/first_name if they changed."""
+    telegram, database, _, _ = service(tmp_path)
+
+    # First registration
+    user1 = FakeUser(user_id=99, username="old_name", first_name="Old")
+    message1 = FakeMessage(text="/start", from_user=user1)
+    asyncio.run(telegram._command_handler(message1))
+
+    # Second registration with changed data
+    user2 = FakeUser(user_id=99, username="new_name", first_name="New")
+    message2 = FakeMessage(text="/start", from_user=user2)
+    asyncio.run(telegram._command_handler(message2))
+
+    user_row = database.get_user(99)
+    assert user_row["username"] == "new_name"
+    assert user_row["first_name"] == "New"
+
+
+def test_unauthorized_user_cannot_use_protected_commands(tmp_path: Path) -> None:
+    """Unregistered user cannot access protected commands."""
+    telegram, _, _, _ = service(tmp_path)
+
+    user = FakeUser(user_id=99)
+    for cmd in ("status", "pending", "stats", "diagnostics", "pause", "resume"):
+        message = FakeMessage(text=f"/{cmd}", from_user=user)
+        asyncio.run(telegram._command_handler(message))
+        assert message.answer_text == "This bot is private."
+
+
+def test_after_start_user_can_use_commands(tmp_path: Path) -> None:
+    """After /start, user is authorized and can use protected commands."""
+    telegram, database, _, _ = service(tmp_path)
+
+    # Register user 99
+    user = FakeUser(user_id=99, username="john_doe", first_name="John")
+    start_message = FakeMessage(text="/start", from_user=user)
+    asyncio.run(telegram._command_handler(start_message))
+
+    # Stage 4\4: create runtime context for the newly registered user
+    context_99 = create_runtime_context(
+        telegram_user_id=99,
+        settings=telegram.settings,
+        database=database,
+    )
+    telegram._contexts[99] = context_99
+
+    # Now protected commands should work
+    assert telegram.authorized(99) is True
+    status_reply = telegram.command("status", user_id=99)
+    assert status_reply != "This bot is private."
+    assert "mode:" in status_reply
+
+def test_registration_does_not_affect_existing_user(tmp_path: Path) -> None:
+    """Registering a new user does not modify existing user 42 data."""
+    telegram, database, _, _ = service(tmp_path)
+
+    # Capture user 42 state before
+    user_42_before = database.get_user(42)
+    assert user_42_before is not None
+
+    # Register user 99
+    user = FakeUser(user_id=99, username="john_doe", first_name="John")
+    message = FakeMessage(text="/start", from_user=user)
+    asyncio.run(telegram._command_handler(message))
+
+    # User 42 unchanged
+    user_42_after = database.get_user(42)
+    assert user_42_after["telegram_user_id"] == 42
+    assert user_42_after["username"] == user_42_before["username"]
+    assert user_42_after["is_active"] == 1
+
+
+def test_existing_user_start_still_works(tmp_path: Path) -> None:
+    """Existing user calling /start remains authorized and gets welcome back."""
+    telegram, database, _, bot = service(tmp_path)
+
+    # User 42 already exists from service() helper
+    assert telegram.authorized(42) is True
+
+    user = FakeUser(user_id=42, username="testuser42", first_name="Test")
+    message = FakeMessage(text="/start", from_user=user)
+    asyncio.run(telegram._command_handler(message))
+
+    # Still authorized, no duplicate
+    assert telegram.authorized(42) is True
+    with database._connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE telegram_user_id = ?", (42,)
+        ).fetchone()[0]
+    assert count == 1
+
+
+# ========== Stage 4\3 focused tests — notify_update_available ==========
+
+
+def test_notify_update_available_uses_explicit_telegram_user_id(tmp_path: Path) -> None:
+    """notify_update_available sends notification to explicitly passed telegram_user_id."""
+    telegram, _, _, bot = service(tmp_path)
+
+    release = ReleaseInfo(tag_name="v2.0.0", html_url="https://example.com/release", name="v2.0.0", published_at="2026-09-01T00:00:00Z", body="Update notes")
+    asyncio.run(telegram.notify_update_available(release, telegram_user_id=99))
+
+    assert len(bot.messages) == 1
+    assert bot.messages[0]["chat_id"] == 99
+    assert "v2.0.0" in bot.messages[0]["text"]
+
+
+def test_notify_update_available_does_not_use_settings_tg_user_id(tmp_path: Path) -> None:
+    """notify_update_available does not depend on settings.tg_user_id (removed)."""
+    telegram, _, _, _ = service(tmp_path)
+
+    # settings no longer has tg_user_id attribute
+    assert not hasattr(telegram.settings, "tg_user_id")
+
+
+# ============================================================================
+# Stage 4\4 — Per-user runtime control isolation via TelegramService
+# ============================================================================
+
+
+def test_pause_resume_isolated_between_two_users(tmp_path: Path) -> None:
+    """Stage 4\4: /pause and /resume affect only the caller's own context."""
+    settings = load_settings(
+        profile_path=write_profile(tmp_path),
+        environ={**VALID_ENV, "APP_MODE": "dry_run"},
+    )
+    settings = replace(settings, database_path=tmp_path / "agent.db")
+    database = Database(settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=42, username="user42", now=NOW)
+    database.create_user(telegram_user_id=43, username="user43", now=NOW)
+
+    ctx_a = create_runtime_context(42, settings, database, load_user_settings(settings))
+    ctx_b = create_runtime_context(43, settings, database, load_user_settings(settings))
+
+    telegram = TelegramService(
+        settings,
+        database,
+        FakeApprovalService(),
+        contexts={42: ctx_a, 43: ctx_b},
+        bot=FakeBot(),
+        now_factory=lambda: NOW,
+    )
+
+    # 1. /pause from user 42 → only ctx_a paused
+    assert telegram.command("pause", user_id=42) == "Agent paused."
+    assert ctx_a.paused is True
+    assert ctx_b.paused is False
+
+    # 2. /status for each user reflects their own context
+    status_a = telegram.command("status", user_id=42)
+    assert "state: paused" in status_a
+    status_b = telegram.command("status", user_id=43)
+    assert "state: running" in status_b
+
+    # 3. /resume from user 43 → ctx_b resumed, ctx_a untouched
+    assert telegram.command("resume", user_id=43) == "Agent resumed."
+    assert ctx_b.paused is False
+    assert ctx_b.wake_event.is_set()
+    assert ctx_a.paused is True
+    assert not ctx_a.wake_event.is_set()
+
+    # 4. /resume from user 42 → ctx_a resumed
+    assert telegram.command("resume", user_id=42) == "Agent resumed."
+    assert ctx_a.paused is False
+    assert ctx_a.wake_event.is_set()
+
+
+def test_pause_without_runtime_context_returns_safe_reply(tmp_path: Path) -> None:
+    """Stage 4\4: /pause without a registered runtime context does not crash."""
+    telegram, _, _, _ = service(tmp_path)
+
+    # Remove the context to simulate polling-only mode
+    telegram._contexts.clear()
+
+    reply = telegram.command("pause", user_id=42)
+    assert reply == "Agent runtime is not running for your account."
+
+    reply = telegram.command("resume", user_id=42)
+    assert reply == "Agent runtime is not running for your account."
+
+    reply = telegram.command("status", user_id=42)
+    assert reply == "Agent runtime is not running for your account."
+
+    reply = telegram.command("diagnostics", user_id=42)
+    assert "runtime not running" in reply
+
+# ============================================================================
+# Stage 4\6 — /status shows the calling user's own app_mode
+# ============================================================================
+
+def test_status_shows_user_specific_mode(tmp_path: Path) -> None:
+    """/status reflects the calling user's own app_mode, not a global one."""
+    from dataclasses import replace as dc_replace
+
+    telegram, database, context, _ = service(tmp_path, "dry_run")
+    # User 42 switches their own runtime to approval mode (immutable replace)
+    context.user_settings = dc_replace(context.user_settings, app_mode="approval")
+
+    status = telegram.command("status", user_id=42)
+    assert "mode: approval" in status

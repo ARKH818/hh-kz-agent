@@ -3,12 +3,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from config import ConfigError, load_settings
+from config import ConfigError, UserSettings, load_settings, load_user_settings
 
 
 VALID_ENV = {
     "TG_BOT_TOKEN": "test-token",
-    "TG_USER_ID": "123456",
     "ENABLE_REAL_APPLY": "false",
     "BROWSER_HEADLESS": "false",
     "CHECK_INTERVAL_MINUTES": "30",
@@ -60,7 +59,6 @@ def test_load_settings_uses_safe_defaults(tmp_path: Path) -> None:
     assert settings.browser_backend == "cloakbrowser"
     assert settings.browser_headless is False
     assert settings.browser_profile_dir.name == ".browser-profile"
-    assert settings.tg_user_id == 123456
     assert settings.profile.candidate.name == "Test Candidate"
     assert settings.profile.hh.search_queries == ("Python developer",)
     assert settings.circuit_breaker_min_sample == 5
@@ -82,7 +80,6 @@ def test_load_settings_uses_safe_defaults(tmp_path: Path) -> None:
             "yes",
             "ENABLE_REAL_APPLY must be true or false",
         ),
-        ("TG_USER_ID", "abc", "TG_USER_ID must be an integer"),
         (
             "MAX_APPLICATIONS_PER_DAY",
             "0",
@@ -181,7 +178,6 @@ def test_load_settings_works_without_profile_file(tmp_path: Path) -> None:
     settings = load_settings(profile_path=None, environ=VALID_ENV)
 
     assert settings.tg_bot_token == "test-token"
-    assert settings.tg_user_id == 123456
     assert settings.app_mode == "dry_run"
     # Profile should be empty defaults
     assert settings.profile.candidate.name == ""
@@ -208,3 +204,79 @@ def test_load_settings_empty_profile_does_not_break_startup(tmp_path: Path) -> N
     # Should not raise - empty profile is valid when not explicitly loaded
     assert settings.profile.candidate.name == ""
     assert settings.profile.hh.resume_name == ""
+
+
+def test_load_settings_works_without_tg_user_id(tmp_path: Path) -> None:
+    """App should start when TG_USER_ID is not set."""
+    settings = load_settings(
+        profile_path=write_profile(tmp_path),
+        environ=VALID_ENV,
+    )
+
+    assert settings.tg_bot_token == "test-token"
+    assert settings.app_mode == "dry_run"
+    assert settings.browser_backend == "cloakbrowser"
+
+# ============================================================================
+# Stage 4\6 — UserSettings / per-user configuration
+# ============================================================================
+
+def test_settings_carries_user_defaults_snapshot(tmp_path: Path) -> None:
+    """Global Settings holds an immutable default UserSettings snapshot."""
+    settings = load_settings(
+        profile_path=write_profile(tmp_path), environ=VALID_ENV
+    )
+    assert isinstance(settings.user_defaults, UserSettings)
+    assert settings.user_defaults.app_mode == "dry_run"
+    assert settings.user_defaults.profile.candidate.name == "Test Candidate"
+
+
+def test_load_user_settings_returns_isolated_instances(tmp_path: Path) -> None:
+    """Two calls to load_user_settings return independent objects."""
+    settings = load_settings(
+        profile_path=write_profile(tmp_path), environ=VALID_ENV
+    )
+    a = load_user_settings(settings)
+    b = load_user_settings(settings)
+    assert a is not b
+    assert a == b  # same values, different objects
+
+
+def test_user_settings_override_does_not_affect_defaults(tmp_path: Path) -> None:
+    """Overriding a field on one UserSettings does not change the snapshot."""
+    settings = load_settings(
+        profile_path=write_profile(tmp_path), environ=VALID_ENV
+    )
+    custom = load_user_settings(settings, app_mode="approval")
+    assert custom.app_mode == "approval"
+    assert settings.user_defaults.app_mode == "dry_run"
+
+
+def test_global_settings_keeps_all_existing_fields(tmp_path: Path) -> None:
+    """Settings retains every pre-4\6 field (no regression)."""
+    settings = load_settings(
+        profile_path=write_profile(tmp_path), environ=VALID_ENV
+    )
+    for field_name in (
+        "tg_bot_token", "app_mode", "enable_real_apply", "browser_backend",
+        "browser_headless", "browser_profile_dir", "database_path", "log_path",
+        "check_interval_minutes", "max_applications_per_day",
+        "max_vacancies_per_query", "max_pages_per_query",
+        "min_seconds_between_actions", "approval_ttl_minutes",
+        "captcha_timeout_seconds", "captcha_max_attempts",
+        "circuit_breaker_min_sample", "circuit_breaker_unknown_ratio",
+        "circuit_breaker_page_errors", "profile",
+    ):
+        assert hasattr(settings, field_name), field_name
+
+
+def test_user_settings_is_frozen(tmp_path: Path) -> None:
+    """UserSettings is immutable; mutation raises FrozenInstanceError."""
+    import dataclasses
+
+    settings = load_settings(
+        profile_path=write_profile(tmp_path), environ=VALID_ENV
+    )
+    us = load_user_settings(settings)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        us.app_mode = "approval"  # type: ignore[misc]

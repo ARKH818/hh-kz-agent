@@ -159,6 +159,7 @@ def test_dry_run_blocks_low_level_send_independently_of_backend(
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+        telegram_user_id=42,
         sleep=no_sleep,
     )
 
@@ -184,6 +185,7 @@ def test_direct_low_level_call_without_individual_permission_is_blocked(
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=1)),
+        telegram_user_id=42,
         sleep=no_sleep,
     )
 
@@ -208,6 +210,7 @@ def test_approval_service_is_the_valid_path_to_physical_submit(tmp_path: Path) -
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+        telegram_user_id=42,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -241,6 +244,7 @@ def test_browser_error_after_claim_becomes_apply_failed(tmp_path: Path) -> None:
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+        telegram_user_id=42,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -269,6 +273,7 @@ def test_page_creation_error_after_claim_becomes_apply_failed(tmp_path: Path) ->
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+        telegram_user_id=42,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -298,6 +303,7 @@ def test_missing_explicit_success_signal_fails_closed(tmp_path: Path) -> None:
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+        telegram_user_id=42,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -326,6 +332,7 @@ def test_employer_questionnaire_blocks_submit(tmp_path: Path) -> None:
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+        telegram_user_id=42,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -354,6 +361,7 @@ def test_success_marker_without_hh_confirmation_fails_closed(tmp_path: Path) -> 
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+        telegram_user_id=42,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -384,6 +392,7 @@ def test_permission_is_rechecked_for_expiry_immediately_before_submit(
         app_settings,
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=29)),
+        telegram_user_id=42,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=60),
     )
@@ -411,6 +420,7 @@ def test_action_delay_never_drops_below_configured_minimum(tmp_path: Path) -> No
         app_settings,
         database,
         ApprovalGuard(app_settings, database),
+        telegram_user_id=42,
         sleep=capture_delay,
     )
 

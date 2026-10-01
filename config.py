@@ -47,9 +47,69 @@ class Profile:
 
 
 @dataclass(frozen=True)
+class UserSettings:
+    """Per-user configuration snapshot owned by a single Telegram user.
+
+    Stage 4\6: every field here is meaningful only in the context of one
+    concrete user.  Each call to :func:`load_user_settings` returns a fresh
+    immutable instance, so two users never share a mutable configuration
+    object.  ``profile`` is stored as an immutable frozen dataclass — the
+    nested tuples make it safe to share by reference between snapshots.
+    """
+
+    app_mode: str
+    enable_real_apply: bool
+    check_interval_minutes: int
+    max_applications_per_day: int
+    approval_ttl_minutes: int
+    profile: Profile
+
+    @classmethod
+    def from_defaults(
+        cls,
+        *,
+        app_mode: str = "dry_run",
+        enable_real_apply: bool = False,
+        check_interval_minutes: int = 30,
+        max_applications_per_day: int = 5,
+        approval_ttl_minutes: int = 30,
+        profile: Profile | None = None,
+    ) -> "UserSettings":
+        """Create an isolated per-user settings instance.
+
+        Each call returns a fresh immutable object; two users therefore
+        never share user-specific configuration.
+        """
+        return cls(
+            app_mode=app_mode,
+            enable_real_apply=enable_real_apply,
+            check_interval_minutes=check_interval_minutes,
+            max_applications_per_day=max_applications_per_day,
+            approval_ttl_minutes=approval_ttl_minutes,
+            profile=profile
+            if profile is not None
+            else Profile(
+                candidate=CandidateProfile("", "", (), "", "", (), (), "", "", (), (), ""),
+                hh=HHProfile("", (), (), ()),
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class Settings:
+    """Global process-level configuration.
+
+    Stage 4\6: this class keeps the *existing* global configuration
+    contract intact (``app_mode``, ``profile``, ``tg_bot_token``,
+    ``database_path`` and all previously existing fields) so that legacy
+    callers, ``setup_wizard.py`` and existing tests keep working.
+
+    In addition it carries ``user_defaults`` — an immutable snapshot used
+    ONLY to bootstrap a user's own :class:`UserSettings` instance.  It is
+    never mutated and never used as live per-user state.
+    """
+
     tg_bot_token: str
-    tg_user_id: int
     app_mode: str
     enable_real_apply: bool
     browser_backend: str
@@ -69,6 +129,8 @@ class Settings:
     circuit_breaker_unknown_ratio: float
     circuit_breaker_page_errors: int
     profile: Profile
+    # Stage 4\6: immutable snapshot of the default per-user configuration.
+    user_defaults: UserSettings
 
 
 def _path(value: str) -> Path:
@@ -184,13 +246,6 @@ def load_settings(
     if browser_backend not in {"cloakbrowser", "playwright"}:
         errors.append("BROWSER_BACKEND must be cloakbrowser or playwright")
 
-    tg_user_id_text = required("TG_USER_ID")
-    try:
-        tg_user_id = int(tg_user_id_text)
-    except ValueError:
-        errors.append("TG_USER_ID must be an integer")
-        tg_user_id = 0
-
     profile_explicitly_loaded = False
     raw_profile: object = {}
 
@@ -268,9 +323,19 @@ def load_settings(
         if not hh.search_queries:
             errors.append("hh.search_queries must not be empty")
 
+    profile = Profile(candidate, hh)
+
+    user_defaults = UserSettings.from_defaults(
+        app_mode=app_mode,
+        enable_real_apply=boolean("ENABLE_REAL_APPLY", "false"),
+        check_interval_minutes=positive_integer("CHECK_INTERVAL_MINUTES", "30"),
+        max_applications_per_day=positive_integer("MAX_APPLICATIONS_PER_DAY", "5"),
+        approval_ttl_minutes=positive_integer("APPROVAL_TTL_MINUTES", "30"),
+        profile=profile,
+    )
+
     settings = Settings(
         tg_bot_token=required("TG_BOT_TOKEN"),
-        tg_user_id=tg_user_id,
         app_mode=app_mode,
         enable_real_apply=boolean("ENABLE_REAL_APPLY", "false"),
         browser_backend=browser_backend,
@@ -295,8 +360,55 @@ def load_settings(
         circuit_breaker_page_errors=positive_integer(
             "CIRCUIT_BREAKER_PAGE_ERRORS", "3"
         ),
-        profile=Profile(candidate, hh),
+        profile=profile,
+        user_defaults=user_defaults,
     )
     if errors:
         raise ConfigError("Configuration error:\n- " + "\n- ".join(dict.fromkeys(errors)))
     return settings
+
+
+def load_user_settings(
+    settings: Settings,
+    *,
+    app_mode: str | None = None,
+    enable_real_apply: bool | None = None,
+    check_interval_minutes: int | None = None,
+    max_applications_per_day: int | None = None,
+    approval_ttl_minutes: int | None = None,
+    profile: Profile | None = None,
+) -> UserSettings:
+    """Build an isolated :class:`UserSettings` snapshot for one user.
+
+    Stage 4\6: EVERY call creates a NEW UserSettings object.  The global
+    ``settings.user_defaults`` is used only as an immutable bootstrap
+    source of default values — it is never returned directly and never
+    shared between users::
+
+        a = load_user_settings(settings)
+        b = load_user_settings(settings)
+        assert a is not b and a == b
+    """
+    defaults = settings.user_defaults
+    return UserSettings(
+        app_mode=app_mode if app_mode is not None else defaults.app_mode,
+        enable_real_apply=(
+            enable_real_apply if enable_real_apply is not None else defaults.enable_real_apply
+        ),
+        check_interval_minutes=(
+            check_interval_minutes
+            if check_interval_minutes is not None
+            else defaults.check_interval_minutes
+        ),
+        max_applications_per_day=(
+            max_applications_per_day
+            if max_applications_per_day is not None
+            else defaults.max_applications_per_day
+        ),
+        approval_ttl_minutes=(
+            approval_ttl_minutes
+            if approval_ttl_minutes is not None
+            else defaults.approval_ttl_minutes
+        ),
+        profile=profile if profile is not None else defaults.profile,
+    )

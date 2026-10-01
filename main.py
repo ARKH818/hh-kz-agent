@@ -16,11 +16,12 @@ from aiogram.exceptions import TelegramAPIError
 
 from approval import ApprovalGuard, ApprovalService
 from browser_backend import BrowserLaunchError, create_browser_backend
-from config import ConfigError, Settings, load_settings
+from config import ConfigError, Settings, load_settings, load_user_settings
 from database import Database, SearchRun, VacancyStatus
 from hh_client import HHClient, PageState, VacancySummary
 from logging_setup import configure_logging
-from tg_bot import AgentControl, TelegramService
+from runtime_context import UserRuntimeContext, create_runtime_context
+from tg_bot import TelegramService
 from vacancy_filter import title_rejection_reason
 from version import __version__
 
@@ -92,16 +93,18 @@ class SearchRunStats:
 
 
 async def process_vacancy(
-    summary: VacancySummary,
-    settings: Settings,
-    database: Database,
+    context: UserRuntimeContext,
     hh_client: HHClient,
     telegram: TelegramService,
+    summary: VacancySummary,
     *,
-    telegram_user_id: int,
     now_factory: Callable[[], datetime] | None = None,
 ) -> VacancyProcessResult:
-    target_user_id = telegram_user_id
+    target_user_id = context.telegram_user_id
+    # Stage 4\6: user-specific behaviour comes from the per-user
+    # configuration owned by this runtime context.
+    settings = context.user_settings
+    database = context.database
     clock = now_factory or (lambda: datetime.now(UTC))
     now = clock()
     existing = database.get(summary.id, telegram_user_id=target_user_id)
@@ -224,16 +227,17 @@ async def process_vacancy(
 
 
 async def run_search_cycle(
-    settings: Settings,
-    database: Database,
+    context: UserRuntimeContext,
     hh_client: HHClient,
     telegram: TelegramService,
-    control: AgentControl,
     *,
-    telegram_user_id: int,
     now_factory: Callable[[], datetime] | None = None,
 ) -> SearchRun:
-    target_user_id = telegram_user_id
+    target_user_id = context.telegram_user_id
+    # Stage 4\6: user-specific behaviour comes from the per-user
+    # configuration owned by this runtime context.
+    settings = context.user_settings
+    database = context.database
     now = now_factory or (lambda: datetime.now(UTC))
     started_at = now()
     stats = SearchRunStats()
@@ -251,25 +255,23 @@ async def run_search_cycle(
             return
         handled_ids.add(summary.id)
         result = await process_vacancy(
-            summary,
-            settings,
-            database,
+            context,
             hh_client,
             telegram,
-            telegram_user_id=target_user_id,
+            summary,
             now_factory=now,
         )
         stats.record(result)
         circuit_reason = stats.circuit_reason(settings)
         if circuit_reason:
             state = "paused_by_circuit_breaker"
-            control.paused = True
-            control.circuit_reason = circuit_reason
+            context.paused = True
+            context.circuit_reason = circuit_reason
 
     try:
         database.expire_approved(now(), telegram_user_id=target_user_id)
         for vacancy in database.unprocessed_discovered(telegram_user_id=target_user_id):
-            if control.paused:
+            if context.paused:
                 break
             await process(
                 VacancySummary(
@@ -280,7 +282,7 @@ async def run_search_cycle(
                 )
             )
         for query in settings.profile.hh.search_queries:
-            if control.paused:
+            if context.paused:
                 break
             logger.info("search_query_started query=%r", query)
 
@@ -304,22 +306,22 @@ async def run_search_cycle(
             )
             if search.error_reason:
                 stats.record_error(search.error_reason)
-                control.consecutive_search_errors += 1
+                context.consecutive_search_errors += 1
             else:
-                control.consecutive_search_errors = 0
+                context.consecutive_search_errors = 0
             if (
-                control.consecutive_search_errors
+                context.consecutive_search_errors
                 >= settings.circuit_breaker_page_errors
             ):
                 circuit_reason = "search_errors"
                 state = "paused_by_circuit_breaker"
-                control.paused = True
-                control.circuit_reason = circuit_reason
+                context.paused = True
+                context.circuit_reason = circuit_reason
             for summary in search.summaries:
-                if control.paused:
+                if context.paused:
                     break
                 await process(summary)
-        if not control.paused:
+        if not context.paused:
             await hh_client.check_messages(telegram.notify)
     except Exception as exc:
         state = "failed"
@@ -357,6 +359,7 @@ async def run_search_cycle(
         error_reasons=dict(stats.error_reasons),
         last_safe_error=stats.last_safe_error,
         circuit_reason=circuit_reason,
+        telegram_user_id=target_user_id,
     )
     if failure is not None:
         raise failure
@@ -365,7 +368,7 @@ async def run_search_cycle(
             await telegram.notify(notification, telegram_user_id=target_user_id)
         except TelegramAPIError:
             database.record_search_run_error(run_id, "telegram_error")
-    result = database.latest_search_run()
+    result = database.latest_search_run(telegram_user_id=target_user_id)
     if result is None:
         raise RuntimeError("search run was not saved")
     logger.info(
@@ -378,70 +381,109 @@ async def run_search_cycle(
 
 
 async def agent_loop(
-    settings: Settings,
-    database: Database,
+    context: UserRuntimeContext,
     hh_client: HHClient,
     telegram: TelegramService,
-    control: AgentControl,
-    *,
-    telegram_user_id: int,
 ) -> None:
-    target_user_id = telegram_user_id
+    target_user_id = context.telegram_user_id
+    # Stage 4\6: the polling interval is a per-user setting.
+    settings = context.user_settings
     while True:
-        if not control.paused:
+        if not context.paused:
             run = await run_search_cycle(
-                settings, database, hh_client, telegram, control,
-                telegram_user_id=target_user_id,
+                context, hh_client, telegram,
             )
-            control.next_run_at = (
+            context.next_run_at = (
                 None
-                if control.paused
+                if context.paused
                 else datetime.fromisoformat(run.finished_at)
                 + timedelta(minutes=settings.check_interval_minutes)
             )
         else:
-            control.next_run_at = None
+            context.next_run_at = None
         try:
             await asyncio.wait_for(
-                control.wake_event.wait(), settings.check_interval_minutes * 60
+                context.wake_event.wait(), settings.check_interval_minutes * 60
             )
         except TimeoutError:
             pass
         finally:
-            control.wake_event.clear()
-            control.next_run_at = None
+            context.wake_event.clear()
+            context.next_run_at = None
 
 
-async def run(settings: Settings) -> None:
+async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
     database = Database(settings.database_path)
     database.init()
     backend = create_browser_backend(settings)
     telegram: TelegramService | None = None
     try:
-        context = await backend.start()
-        guard = ApprovalGuard(settings, database)
-        hh_client = HHClient(context, settings, database, guard)
+        browser_context = await backend.start()
+
+        if telegram_user_id is None:
+            # Stage 4\3: polling-only mode. No user-specific runtime
+            # components are created; the bot answers commands but no
+            # agent loop is started.
+            approval_service = ApprovalService(
+                settings.user_defaults, database, _NullSender()
+            )
+            telegram = TelegramService(
+                settings,
+                database,
+                approval_service,
+                contexts={},
+            )
+            if hasattr(telegram, "check_updates"):
+                asyncio.create_task(telegram.check_updates(notify=True))
+            await telegram.start_polling()
+            return
+
+        # Stage 4\6: materialise the ONE per-user configuration instance.
+        # Every user-scoped component below shares this exact object.
+        user_settings = load_user_settings(settings)
+
+        # Stage 4\4: legacy single-user agent loop with explicit
+        # telegram_user_id. Runtime control state lives inside the
+        # per-user UserRuntimeContext — no shared AgentControl.
+        # The context stores the very same UserSettings instance.
+        context = create_runtime_context(
+            telegram_user_id=telegram_user_id,
+            settings=settings,
+            database=database,
+            user_settings=user_settings,
+        )
+
+        # Stage 4\5: HHClient получает явный telegram_user_id через конструктор.
+        # Инвариант: hh_client.telegram_user_id == telegram_user_id
+        hh_client = HHClient(
+            browser_context,
+            settings,
+            database,
+            telegram_user_id=telegram_user_id,
+            user_settings=context.user_settings,
+        )
         if not await hh_client.ensure_login():
             raise RuntimeError(
                 "HH.kz login is required. Run with BROWSER_HEADLESS=false "
                 "and sign in manually."
             )
 
-        control = AgentControl()
+        # Stage 4\6: approval components share the user's single settings.
+        guard = ApprovalGuard(context.user_settings, database)
+        approval_service = ApprovalService(context.user_settings, database, hh_client)
 
-        approval_service = ApprovalService(settings, database, hh_client)
         telegram = TelegramService(
             settings,
             database,
             approval_service,
-            control,
+            contexts={telegram_user_id: context},
         )
+
         if hasattr(telegram, "check_updates"):
             asyncio.create_task(telegram.check_updates(notify=True))
         await asyncio.gather(
             telegram.start_polling(),
-            agent_loop(settings, database, hh_client, telegram, control,
-                       telegram_user_id=settings.tg_user_id),
+            agent_loop(context, hh_client, telegram),
         )
     finally:
         try:
@@ -449,6 +491,19 @@ async def run(settings: Settings) -> None:
                 await telegram.stop()
         finally:
             await backend.close()
+
+
+class _NullSender:
+    """Polling-only mode never submits applications.
+
+    Stage 4\3: when no telegram_user_id is given there is no agent
+    runtime, so the approval service is wired to a sender that always
+    refuses.  This keeps TelegramService constructible without creating
+    any user-specific runtime components.
+    """
+
+    async def submit_application(self, permission) -> bool:
+        return False
 
 
 def cli(argv: list[str] | None = None) -> int:
@@ -461,6 +516,12 @@ def cli(argv: list[str] | None = None) -> int:
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--check-config", action="store_true")
+    parser.add_argument(
+        "--telegram-user-id",
+        type=int,
+        default=None,
+        help="Run legacy single-user agent loop for the given Telegram user ID",
+    )
     args = parser.parse_args(argv)
     try:
         settings = load_settings(args.env_file, args.profile)
@@ -475,7 +536,7 @@ def cli(argv: list[str] | None = None) -> int:
         return 0
     configure_logging(settings.log_path)
     try:
-        asyncio.run(run(settings))
+        asyncio.run(run(settings, telegram_user_id=args.telegram_user_id))
     except (BrowserLaunchError, RuntimeError) as exc:
         logger.error("startup_failed error=%s", exc)
         print(exc, file=sys.stderr)

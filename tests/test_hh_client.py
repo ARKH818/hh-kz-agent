@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from approval import ApplicationPermission, ApprovalGuard
-from config import load_settings
+from config import load_settings, load_user_settings
 from database import Database
 from hh_client import HHClient, PageState, VacancySummary, classify_page
 from tests.test_config import VALID_ENV, write_profile
@@ -223,6 +223,7 @@ def test_visible_but_empty_description_reports_structure_change(tmp_path: Path) 
         settings,
         database,
         ApprovalGuard(settings, database),
+        telegram_user_id=42,
     )
     summary = VacancySummary(
         "job-1", "Developer", "https://example.com/vacancy/job-1", "Python"
@@ -241,7 +242,8 @@ def test_page_creation_failure_reports_network_error(tmp_path: Path) -> None:
     database = Database(settings.database_path)
     database.init()
     client = HHClient(
-        FailingContext(), settings, database, ApprovalGuard(settings, database)
+        FailingContext(), settings, database, ApprovalGuard(settings, database),
+        telegram_user_id=42,
     )
     summary = VacancySummary(
         "job-1", "Developer", "https://example.com/vacancy/job-1", "Python"
@@ -261,7 +263,8 @@ def test_search_page_creation_failure_returns_safe_error(tmp_path: Path) -> None
     database = Database(settings.database_path)
     database.init()
     client = HHClient(
-        FailingContext(), settings, database, ApprovalGuard(settings, database)
+        FailingContext(), settings, database, ApprovalGuard(settings, database),
+        telegram_user_id=42,
     )
 
     result = asyncio.run(client.search_vacancies("Python", (), ()))
@@ -300,6 +303,7 @@ def test_search_ignores_ad_redirects_without_numeric_vacancy_id(
         database,
         ApprovalGuard(settings, database),
         sleep=no_sleep,
+        telegram_user_id=42,
     )
 
     result = asyncio.run(client.search_vacancies("DevOps", (), ()))
@@ -344,6 +348,7 @@ def test_search_counts_found_new_and_existing_results(tmp_path: Path) -> None:
         database,
         ApprovalGuard(settings, database),
         sleep=no_sleep,
+        telegram_user_id=42,
     )
 
     result = asyncio.run(client.search_vacancies("DevOps", (), ()))
@@ -397,6 +402,7 @@ def test_search_returns_only_pending_existing_vacancies_as_repeats(
         database,
         ApprovalGuard(settings, database),
         sleep=no_sleep,
+        telegram_user_id=42,
     )
 
     result = asyncio.run(client.search_vacancies("DevOps", (), ()))
@@ -422,6 +428,7 @@ def test_read_vacancy_collects_safe_company_url(tmp_path: Path) -> None:
         database,
         ApprovalGuard(settings, database),
         sleep=lambda _: asyncio.sleep(0),
+        telegram_user_id=42,
     )
 
     result = asyncio.run(
@@ -447,6 +454,7 @@ def test_read_company_details_parses_rating_and_review_count(tmp_path: Path) -> 
         database,
         ApprovalGuard(settings, database),
         sleep=lambda _: asyncio.sleep(0),
+        telegram_user_id=42,
     )
 
     result = asyncio.run(client.read_company_details("https://hh.kz/employer/123"))
@@ -467,6 +475,7 @@ def test_read_company_details_rejects_non_hh_url(tmp_path: Path) -> None:
         settings,
         database,
         ApprovalGuard(settings, database),
+        telegram_user_id=42,
     )
 
     result = asyncio.run(client.read_company_details("https://example.com/employer/1"))
@@ -494,6 +503,7 @@ def test_login_check_retries_temporary_navigation_errors(tmp_path: Path) -> None
         database,
         ApprovalGuard(settings, database),
         sleep=no_sleep,
+        telegram_user_id=42,
     )
 
     assert asyncio.run(client.ensure_login())
@@ -510,7 +520,8 @@ def test_captcha_solution_uses_submit_button(tmp_path: Path) -> None:
     database.init()
     page = CaptchaPage()
     client = HHClient(
-        FakeContext(page), settings, database, ApprovalGuard(settings, database)
+        FakeContext(page), settings, database, ApprovalGuard(settings, database),
+        telegram_user_id=42,
     )
     summary = VacancySummary(
         "job-1", "Developer", "https://example.com/vacancy/job-1", "Python"
@@ -622,6 +633,17 @@ class ResumeTrackingPage:
         return None
 
 
+
+def _approval_user_settings(settings):
+    """Explicit approval-enabled UserSettings snapshot for Stage 3.6 tests."""
+    return load_user_settings(
+        settings,
+        app_mode="approval",
+        enable_real_apply=True,
+        max_applications_per_day=10,
+        approval_ttl_minutes=30,
+    )
+
 def _setup_user_with_resume(
     database: Database,
     telegram_user_id: int,
@@ -686,6 +708,8 @@ def test_user_42_uses_only_own_resume(tmp_path: Path) -> None:
     database.init()
     now = NOW
 
+    user_settings = _approval_user_settings(settings)
+
     _setup_user_with_resume(database, 42, "Resume FortyTwo", now)
     permit = _setup_vacancy_and_approve(database, "job-42", 42, now)
 
@@ -694,9 +718,11 @@ def test_user_42_uses_only_own_resume(tmp_path: Path) -> None:
         FakeContext(page),
         settings,
         database,
-        ApprovalGuard(settings, database, now_factory=lambda: NOW),
+        ApprovalGuard(user_settings, database, now_factory=lambda: NOW),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: NOW,
+        telegram_user_id=42,
+        user_settings=user_settings,
     )
 
     permission = ApplicationPermission("job-42", permit, 42)
@@ -721,6 +747,8 @@ def test_user_43_uses_only_own_resume(tmp_path: Path) -> None:
     database.init()
     now = NOW
 
+    user_settings = _approval_user_settings(settings)
+
     _setup_user_with_resume(database, 43, "Resume FortyThree", now)
     permit = _setup_vacancy_and_approve(database, "job-43", 43, now)
 
@@ -729,9 +757,11 @@ def test_user_43_uses_only_own_resume(tmp_path: Path) -> None:
         FakeContext(page),
         settings,
         database,
-        ApprovalGuard(settings, database, now_factory=lambda: NOW),
+        ApprovalGuard(user_settings, database, now_factory=lambda: NOW),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: NOW,
+        telegram_user_id=43,
+        user_settings=user_settings,
     )
 
     permission = ApplicationPermission("job-43", permit, 43)
@@ -756,6 +786,8 @@ def test_user_42_cannot_use_user_43_resume(tmp_path: Path) -> None:
     database.init()
     now = NOW
 
+    user_settings = _approval_user_settings(settings)
+
     # User 42 has resume "Resume FortyTwo"
     _setup_user_with_resume(database, 42, "Resume FortyTwo", now)
     # User 43 has resume "Resume FortyThree"
@@ -769,9 +801,11 @@ def test_user_42_cannot_use_user_43_resume(tmp_path: Path) -> None:
         FakeContext(page),
         settings,
         database,
-        ApprovalGuard(settings, database, now_factory=lambda: NOW),
+        ApprovalGuard(user_settings, database, now_factory=lambda: NOW),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: NOW,
+        telegram_user_id=42,
+        user_settings=user_settings,
     )
 
     permission = ApplicationPermission("job-42", permit, 42)
@@ -798,6 +832,8 @@ def test_missing_resume_does_not_fall_back_to_global_profile(tmp_path: Path) -> 
     database.init()
     now = NOW
 
+    user_settings = _approval_user_settings(settings)
+
     # User exists but has NO resume
     database.get_or_create_user(
         telegram_user_id=42,
@@ -813,9 +849,11 @@ def test_missing_resume_does_not_fall_back_to_global_profile(tmp_path: Path) -> 
         FakeContext(page),
         settings,
         database,
-        ApprovalGuard(settings, database, now_factory=lambda: NOW),
+        ApprovalGuard(user_settings, database, now_factory=lambda: NOW),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: NOW,
+        telegram_user_id=42,
+        user_settings=user_settings,
     )
 
     permission = ApplicationPermission("job-42", permit, 42)

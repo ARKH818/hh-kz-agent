@@ -15,7 +15,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 from uuid import uuid4
 
 from approval import ApplicationPermission, ApprovalGuard
-from config import Settings
+from config import Settings, UserSettings, load_user_settings
 from database import Database, VacancyStatus
 from vacancy_filter import is_relevant_logistics_title
 
@@ -248,7 +248,9 @@ class HHClient:
         settings: Settings,
         database: Database,
         approval_guard: ApprovalGuard,
+        telegram_user_id: int,
         *,
+        user_settings: UserSettings | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now_factory: Callable[[], datetime] | None = None,
     ):
@@ -256,6 +258,14 @@ class HHClient:
         self.settings = settings
         self.database = database
         self.approval_guard = approval_guard
+        self.telegram_user_id = telegram_user_id
+        # Stage 4\6: the per-user configuration shared with the owning
+        # UserRuntimeContext (identity preserved).  When omitted (legacy
+        # callers), materialise a FRESH snapshot from the immutable global
+        # defaults — never a shared mutable object.
+        self.user_settings = (
+            user_settings if user_settings is not None else load_user_settings(settings)
+        )
         self.sleep = sleep
         self.now_factory = now_factory or (lambda: datetime.now(UTC))
 
@@ -601,31 +611,31 @@ class HHClient:
                 claim.reason,
             )
             return False
-    
+
         vacancy = claim.vacancy
         page = None
-    
+
         try:
             page = await self.context.new_page()
             await self._delay()
-    
+
             await page.goto(
                 vacancy.url,
                 wait_until="domcontentloaded",
                 timeout=30_000,
             )
-    
+
             response_button = page.locator(
                 'a[data-qa="vacancy-response-link-top"], '
                 'button[data-qa="vacancy-response-link-top"]'
             ).first
-    
+
             if not await response_button.is_visible():
                 raise RuntimeError("application response control was not found")
-    
+
             await response_button.click()
             await self._delay()
-    
+
             if hasattr(page, "content"):
                 html = await page.content()
                 with open(
@@ -634,7 +644,7 @@ class HHClient:
                     encoding="utf-8",
                 ) as file:
                     file.write(html)
-    
+
             # User-scoped resume selection from database
             profile = self.database.get_active_profile(permission.telegram_user_id)
             resume_name = profile.hh.resume_name if profile else ""
@@ -642,42 +652,42 @@ class HHClient:
                 '[data-qa*="resume-select"], '
                 '[data-qa*="resume-selector"]'
             ).first
-    
+
             if resume_name and await resume_selector.is_visible():
                 await resume_selector.click()
-    
+
                 option = page.get_by_text(
                     resume_name,
                     exact=True,
                 ).first
-    
+
                 if not await option.is_visible():
                     raise RuntimeError("configured resume was not found")
-    
+
                 await option.click()
-    
+
             if await page.locator('textarea[name^="task_"]').count() > 0:
                 raise QuestionnaireRequiredError("questionnaire_required")
-    
+
             submit_button = page.locator(
                 'button[data-qa*="vacancy-response-submit"]:visible, '
                 'button[type="submit"]:visible, '
                 'button:has-text("Откликнуться"):visible, '
                 'button:has-text("Отправить"):visible'
             ).first
-    
+
             if not await submit_button.is_visible():
                 raise RuntimeError("final application button was not found")
-    
+
             if not self.database.mark_submit_attempt(
                 permission.job_id,
                 permission.permit,
                 telegram_user_id=permission.telegram_user_id,
                 now=self.now_factory(),
-                daily_limit=self.settings.max_applications_per_day,
+                daily_limit=self.user_settings.max_applications_per_day,
             ):
                 error = "application permission failed final pre-submit validation"
-    
+
                 self.database.complete_application(
                     permission.job_id,
                     permission.permit,
@@ -685,15 +695,15 @@ class HHClient:
                     now=self.now_factory(),
                     error_text=error,
                 )
-    
+
                 logger.warning(
                     "application_blocked job_id=%s reason=pre_submit_recheck",
                     permission.job_id,
                 )
                 return False
-    
+
             await submit_button.click()
-    
+
             success_marker = page.locator(
                 '[data-qa="vacancy-response-success-standard-notification"], '
                 '[data-qa="vacancy-response-success"], '
@@ -704,7 +714,7 @@ class HHClient:
                     exact=False,
                 )
             ).first
-    
+
             try:
                 await success_marker.wait_for(
                     state="visible",
@@ -714,7 +724,7 @@ class HHClient:
                 raise RuntimeError(
                     "HH.kz did not provide an explicit application success signal"
                 )
-    
+
             if not await self._response_confirmed(
                 page,
                 vacancy.url,
@@ -722,7 +732,7 @@ class HHClient:
                 raise RuntimeError(
                     "HH.kz did not confirm the application"
                 )
-    
+
             if not self.database.complete_application(
                 permission.job_id,
                 permission.permit,
@@ -732,14 +742,14 @@ class HHClient:
                 raise RuntimeError(
                     "application status could not be completed"
                 )
-    
+
             logger.info(
                 "application_sent job_id=%s",
                 permission.job_id,
             )
-    
+
             return True
-    
+
         except Exception as exc:
             completed = self.database.complete_application(
                 permission.job_id,
@@ -748,7 +758,7 @@ class HHClient:
                 now=self.now_factory(),
                 error_text=str(exc),
             )
-    
+
             if not completed:
                 logger.warning(
                     "application_failure_status_not_updated "
@@ -756,15 +766,15 @@ class HHClient:
                     permission.job_id,
                     exc,
                 )
-    
+
             logger.error(
                 "application_failed job_id=%s error=%s",
                 permission.job_id,
                 exc,
             )
-    
+
             return False
-    
+
         finally:
             if page is not None:
                 try:

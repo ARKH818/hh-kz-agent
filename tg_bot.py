@@ -4,7 +4,7 @@ import asyncio
 import html
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,21 +30,14 @@ from aiogram.types import (
 from approval import ApprovalService
 from config import Settings
 from database import Database, Vacancy
+from runtime_context import UserRuntimeContext
 from updater import ReleaseInfo, check_github_release
 from version import __version__
 
 
 logger = logging.getLogger(__name__)
 PRIVATE_REPLY = "This bot is private."
-
-
-@dataclass
-class AgentControl:
-    paused: bool = False
-    circuit_reason: str = ""
-    consecutive_search_errors: int = 0
-    next_run_at: datetime | None = None
-    wake_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+NO_RUNTIME_REPLY = "Agent runtime is not running for your account."
 
 
 class TelegramService:
@@ -53,7 +46,7 @@ class TelegramService:
         settings: Settings,
         database: Database,
         approval_service: ApprovalService,
-        control: AgentControl,
+        contexts: dict[int, UserRuntimeContext] | None = None,
         *,
         bot: Any | None = None,
         dispatcher: Dispatcher | None = None,
@@ -62,7 +55,9 @@ class TelegramService:
         self.settings = settings
         self.database = database
         self.approval_service = approval_service
-        self.control = control
+        self._contexts: dict[int, UserRuntimeContext] = (
+            contexts if contexts is not None else {}
+        )
         self.bot = bot or Bot(token=settings.tg_bot_token)
         self.dispatcher = dispatcher or Dispatcher()
         self.now_factory = now_factory or (lambda: datetime.now().astimezone())
@@ -75,36 +70,69 @@ class TelegramService:
         user = self.database.get_user(user_id)
         return user is not None and user["is_active"] == 1
 
-    def command(self, name: str, user_id: int) -> str:
+    def _runtime_context(self, user_id: int) -> UserRuntimeContext | None:
+        return self._contexts.get(user_id)
+
+    def command(
+        self,
+        name: str,
+        user_id: int,
+        *,
+        username: str | None = None,
+        first_name: str | None = None,
+    ) -> str:
+        if name == "start":
+            self.database.get_or_create_user(
+                telegram_user_id=user_id,
+                username=username,
+                first_name=first_name,
+                now=self.now_factory(),
+            )
+            if self.authorized(user_id):
+                return "Welcome back! HH.kz Agent is ready."
+            return "Welcome! You are now registered with HH.kz Agent."
         if not self.authorized(user_id):
             return PRIVATE_REPLY
-        if name == "start":
-            return "HH.kz Agent is ready. Use /status to inspect it."
         if name == "pause":
-            self.control.paused = True
-            self.control.next_run_at = None
-            logger.info("agent_paused")
+            context = self._runtime_context(user_id)
+            if context is None:
+                return NO_RUNTIME_REPLY
+            context.paused = True
+            context.next_run_at = None
+            logger.info("agent_paused user=%s", user_id)
             return "Agent paused."
         if name == "resume":
-            self.control.paused = False
-            self.control.circuit_reason = ""
-            self.control.consecutive_search_errors = 0
-            self.control.next_run_at = None
-            self.control.wake_event.set()
-            logger.info("agent_resumed")
+            context = self._runtime_context(user_id)
+            if context is None:
+                return NO_RUNTIME_REPLY
+            context.paused = False
+            context.circuit_reason = ""
+            context.consecutive_search_errors = 0
+            context.next_run_at = None
+            context.wake_event.set()
+            logger.info("agent_resumed user=%s", user_id)
             return "Agent resumed."
         if name == "status":
+            context = self._runtime_context(user_id)
+            if context is None:
+                return NO_RUNTIME_REPLY
             stats = self.database.stats(telegram_user_id=user_id)
             processed = sum(stats.values())
             version_str = f"v{__version__}"
             if self.latest_release is not None:
                 version_str += f" (доступно обновление {self.latest_release.tag_name})"
+            # Stage 4\6: the mode shown is the calling user's own setting.
+            user_mode = (
+                context.user_settings.app_mode
+                if context is not None
+                else self.settings.user_defaults.app_mode
+            )
             return (
-                f"версия: {version_str}\n"
-                f"mode: {self.settings.app_mode}\n"
-                f"state: {'paused' if self.control.paused else 'running'}\n"
-                f"processed: {processed}\n"
-                f"applied today: {self.database.applied_today(self.now_factory(), telegram_user_id=user_id)}"
+                "версия: " + version_str + "\n"
+                "mode: " + user_mode + "\n"
+                "state: " + ("paused" if context.paused else "running") + "\n"
+                "processed: " + str(processed) + "\n"
+                "applied today: " + str(self.database.applied_today(self.now_factory(), telegram_user_id=user_id))
             )
         if name == "pending":
             pending = self.database.pending(telegram_user_id=user_id)
@@ -128,12 +156,18 @@ class TelegramService:
         return "Unknown command."
 
     def _diagnostics(self, user_id: int) -> str:
-        run = self.database.latest_search_run(telegram_user_id=user_id)
+        context = self._runtime_context(user_id)
         version_str = f"v{__version__}"
         if self.latest_release is not None:
             version_str += f" (доступно: {self.latest_release.tag_name})"
+        if context is None:
+            return (
+                "версия: " + version_str + "\n"
+                "runtime not running"
+            )
+        run = self.database.latest_search_run(telegram_user_id=user_id)
         if run is None:
-            return f"версия: {version_str}\nNo search diagnostics recorded."
+            return "версия: " + version_str + "\nNo search diagnostics recorded."
         started = datetime.fromisoformat(run.started_at)
         finished = datetime.fromisoformat(run.finished_at)
         reasons = ", ".join(
@@ -145,37 +179,36 @@ class TelegramService:
             for reason, count in sorted(run.error_reasons.items())
         ) or "нет"
         breaker = (
-            f"open ({self.control.circuit_reason})"
-            if self.control.circuit_reason
+            f"open ({context.circuit_reason})"
+            if context.circuit_reason
             else "closed"
         )
-        if self.control.paused:
+        if context.paused:
             next_run = "paused"
-        elif self.control.next_run_at is None:
+        elif context.next_run_at is None:
             next_run = "после текущего цикла"
         else:
-            next_run = self.control.next_run_at.astimezone().strftime(
+            next_run = context.next_run_at.astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
         return (
-            f"версия: {version_str}\n"
-            f"последний цикл: {started.astimezone():%Y-%m-%d %H:%M:%S}\n"
-            f"состояние: {run.state}\n"
-            f"длительность: {int((finished - started).total_seconds())} с\n"
-            f"запросы: {run.query_count}\n"
-            f"найдено: {run.found_results}\n"
-            f"новые: {run.new_vacancies}\n"
-            f"дубли: {run.duplicates}\n"
-            f"отклонено — фильтр: {run.rejected_by_filter}\n"
-            f"причины: {reasons}\n"
-            f"карточки: {run.telegram_cards}\n"
-            f"ошибки: {run.error_count} ({errors})\n"
-            f"последняя ошибка: {run.last_safe_error or 'нет'}\n"
-            f"breaker: {breaker}\n"
-            f"last breaker: {run.circuit_reason or 'none'}\n"
-            f"следующий запуск: {next_run}"
+            "версия: " + version_str + "\n"
+            "последний цикл: " + started.astimezone().strftime("%Y-%m-%d %H:%M:%S") + "\n"
+            "состояние: " + run.state + "\n"
+            "длительность: " + str(int((finished - started).total_seconds())) + " с\n"
+            "запросы: " + str(run.query_count) + "\n"
+            "найдено: " + str(run.found_results) + "\n"
+            "новые: " + str(run.new_vacancies) + "\n"
+            "дубли: " + str(run.duplicates) + "\n"
+            "отклонено — фильтр: " + str(run.rejected_by_filter) + "\n"
+            "причины: " + reasons + "\n"
+            "карточки: " + str(run.telegram_cards) + "\n"
+            "ошибки: " + str(run.error_count) + " (" + errors + ")\n"
+            "последняя ошибка: " + (run.last_safe_error or "нет") + "\n"
+            "breaker: " + breaker + "\n"
+            "last breaker: " + (run.circuit_reason or "none") + "\n"
+            "следующий запуск: " + next_run
         )
-
     def _register_handlers(self) -> None:
         for name in (
             "start",
@@ -196,10 +229,19 @@ class TelegramService:
 
     async def _command_handler(self, message: Message) -> None:
         name = (message.text or "").split()[0].lstrip("/").split("@")[0]
-        if not self.authorized(message.from_user.id):
+        user_id = message.from_user.id
+        # /start is allowed for unauthorized users to enable registration
+        if name == "start":
+            username = message.from_user.username
+            first_name = message.from_user.first_name
+            await message.answer(
+                self.command(name, user_id, username=username, first_name=first_name)
+            )
+            return
+        if not self.authorized(user_id):
             await message.answer(PRIVATE_REPLY)
             return
-        await message.answer(self.command(name, message.from_user.id))
+        await message.answer(self.command(name, user_id))
 
     async def _callback_handler(self, callback: CallbackQuery) -> None:
         if not self.authorized(callback.from_user.id):
@@ -384,10 +426,10 @@ class TelegramService:
     ) -> None:
         target_user_id = telegram_user_id
         text = (
-            f"📋 <b>Требуется ручной отклик (тестовое / анкета)</b>\n"
-            f"<b>{html.escape(title)}</b>\n"
-            f'<a href="{html.escape(url, quote=True)}">Открыть вакансию на HH.ru</a>\n\n'
-            f"Работодатель требует заполнении анкеты или выполнение тестового задания."
+            "📋 <b>Требуется ручной отклик (тестовое / анкета)</b>\n"
+            "<b>" + html.escape(title) + "</b>\n"
+            + '<a href="' + html.escape(url, quote=True) + '">Открыть вакансию на HH.ru</a>\n\n'
+            + "Работодатель требует заполнении анкеты или выполнение тестового задания."
         )
         try:
             await self.bot.send_message(
@@ -408,7 +450,7 @@ class TelegramService:
         await self.bot.send_photo(
             chat_id=target_user_id,
             photo=FSInputFile(screenshot),
-            caption=f"CAPTCHA detected for: {title}\nReply with the text or use /cancel.",
+            caption="CAPTCHA detected for: " + title + "\nReply with the text or use /cancel.",
         )
         try:
             return await asyncio.wait_for(self._captcha_future, timeout_seconds)
@@ -417,7 +459,7 @@ class TelegramService:
         finally:
             self._captcha_future = None
 
-    async def check_updates(self, notify: bool = True) -> ReleaseInfo | None:
+    async def check_updates(self, notify: bool = True, telegram_user_id: int | None = None) -> ReleaseInfo | None:
         try:
             release = await check_github_release(current_version=__version__)
         except Exception as exc:
@@ -427,18 +469,21 @@ class TelegramService:
             self.latest_release = release
             if notify and self._notified_release_tag != release.tag_name:
                 self._notified_release_tag = release.tag_name
-                await self.notify_update_available(release)
+                # Stage 4\3: notify only if explicit telegram_user_id provided
+                # (per-user broadcast belongs to 4\4)
+                if telegram_user_id is not None:
+                    await self.notify_update_available(release, telegram_user_id)
         return release
 
-    async def notify_update_available(self, release: ReleaseInfo) -> None:
+    async def notify_update_available(self, release: ReleaseInfo, telegram_user_id: int) -> None:
         text = (
-            f"🚀 <b>Доступно обновление HH.kz Agent {html.escape(release.tag_name)}!</b>\n"
-            f"Текущая версия: <code>v{__version__}</code>\n\n"
-            f'<a href="{html.escape(release.html_url, quote=True)}">Посмотреть список изменений на GitHub</a>'
+            "🚀 <b>Доступно обновление HH.kz Agent " + html.escape(release.tag_name) + "!</b>\n"
+            "Текущая версия: <code>v" + __version__ + "</code>\n\n"
+            + '<a href="' + html.escape(release.html_url, quote=True) + '">Посмотреть список изменений на GitHub</a>'
         )
         try:
             await self.bot.send_message(
-                chat_id=self.settings.tg_user_id,
+                chat_id=telegram_user_id,
                 text=text,
                 parse_mode="HTML",
                 disable_web_page_preview=True,

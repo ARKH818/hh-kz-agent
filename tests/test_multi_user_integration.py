@@ -19,9 +19,10 @@ from pathlib import Path
 import pytest
 
 from approval import ApplicationPermission, ApprovalGuard, ApprovalService
-from config import load_settings
+from config import load_settings, load_user_settings
 from database import Database, VacancyStatus
 from hh_client import HHClient
+from runtime_context import create_runtime_context
 
 # Re-use existing test helpers from test_hh_client.py
 from tests.test_hh_client import (
@@ -31,12 +32,11 @@ from tests.test_hh_client import (
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
 
-# Minimal environment for Settings — no global profile.yaml
+# Minimal environment for Settings — no global profile.yaml, no TG_USER_ID
 _MINIMAL_ENV = {
     "TG_BOT_TOKEN": "fake-token",
-    "TG_USER_ID": "42",
-    "APP_MODE": "approval",
-    "ENABLE_REAL_APPLY": "true",
+    "APP_MODE": "dry_run",
+    "ENABLE_REAL_APPLY": "false",
     "BROWSER_BACKEND": "playwright",
     "BROWSER_HEADLESS": "false",
 }
@@ -52,8 +52,6 @@ def _make_settings(tmp_path: Path) -> object:
         loaded,
         database_path=tmp_path / "agent.db",
         min_seconds_between_actions=0,
-        max_applications_per_day=10,
-        approval_ttl_minutes=30,
     )
 
 
@@ -129,6 +127,42 @@ def _setup_vacancy_and_approve(
 
 
 # ============================================================================
+# Stage 4\5: HHClient user identity isolation
+# ============================================================================
+
+def test_hh_client_user_identity_isolation(tmp_path: Path) -> None:
+    """HHClient для user 42 и user 43 имеют разные telegram_user_id."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+
+    guard = ApprovalGuard(settings, database)
+
+    us_42 = load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30)
+    us_43 = load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30)
+    client_42 = HHClient(
+        FakeContext(ResumeTrackingPage()),
+        settings,
+        database,
+        guard,
+        telegram_user_id=42,
+        user_settings=us_42,
+    )
+    client_43 = HHClient(
+        FakeContext(ResumeTrackingPage()),
+        settings,
+        database,
+        guard,
+        telegram_user_id=43,
+        user_settings=us_43,
+    )
+
+    assert client_42.telegram_user_id == 42
+    assert client_43.telegram_user_id == 43
+    assert client_42.telegram_user_id != client_43.telegram_user_id
+
+
+# ============================================================================
 # Positive scenarios: each user has their own isolated flow
 # ============================================================================
 
@@ -160,7 +194,7 @@ def test_user_42_full_flow_isolated(tmp_path: Path) -> None:
     # 5. Submit application via HHClient with fake browser.
     #    NOTE: submit_application() calls approval_guard.claim() internally,
     #    so we do NOT call guard.claim() separately here.
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     permission = ApplicationPermission("job-42", permit_42, 42)
 
     page = ResumeTrackingPage(expected_resume="Resume FortyTwo")
@@ -169,6 +203,8 @@ def test_user_42_full_flow_isolated(tmp_path: Path) -> None:
         settings,
         database,
         guard,
+        telegram_user_id=42,
+        user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
     )
@@ -206,7 +242,7 @@ def test_user_43_full_flow_isolated(tmp_path: Path) -> None:
     assert vacancy.approver_id == 43
 
     # 5. Submit via HHClient (claim happens inside submit_application)
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     permission = ApplicationPermission("job-43", permit_43, 43)
 
     page = ResumeTrackingPage(expected_resume="Resume FortyThree")
@@ -215,6 +251,8 @@ def test_user_43_full_flow_isolated(tmp_path: Path) -> None:
         settings,
         database,
         guard,
+        telegram_user_id=43,
+        user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
     )
@@ -245,7 +283,7 @@ def test_user_42_cannot_claim_user_43_permit(tmp_path: Path) -> None:
     permit_43 = _setup_vacancy_and_approve(database, "job-43", 43, now)
 
     # User 42 tries to claim with User 43's permit
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     permission = ApplicationPermission("job-43", permit_43, 42)
     claim = guard.claim(permission)
 
@@ -266,7 +304,7 @@ def test_user_43_cannot_claim_user_42_permit(tmp_path: Path) -> None:
 
     permit_42 = _setup_vacancy_and_approve(database, "job-42", 42, now)
 
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     permission = ApplicationPermission("job-42", permit_42, 43)
     claim = guard.claim(permission)
 
@@ -289,12 +327,14 @@ def test_user_42_cannot_use_user_43_resume(tmp_path: Path) -> None:
 
     # The fake page only shows User 43's resume (simulating wrong resume on HH page)
     page = ResumeTrackingPage(expected_resume="Resume FortyThree")
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     client = HHClient(
         FakeContext(page),
         settings,
         database,
         guard,
+        telegram_user_id=42,
+        user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
     )
@@ -321,12 +361,14 @@ def test_user_43_cannot_use_user_42_resume(tmp_path: Path) -> None:
 
     # Fake page only shows User 42's resume
     page = ResumeTrackingPage(expected_resume="Resume FortyTwo")
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     client = HHClient(
         FakeContext(page),
         settings,
         database,
         guard,
+        telegram_user_id=43,
+        user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
     )
@@ -370,16 +412,20 @@ def test_both_users_complete_flows_independently(tmp_path: Path) -> None:
     assert database.get("job-43").approver_id == 43
 
     # Submit both via HHClient (claim happens inside submit_application)
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
 
     page_42 = ResumeTrackingPage(expected_resume="Resume FortyTwo")
     page_43 = ResumeTrackingPage(expected_resume="Resume FortyThree")
 
+    us_42 = load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30)
+    us_43 = load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30)
     client_42 = HHClient(
         FakeContext(page_42),
         settings,
         database,
         guard,
+        telegram_user_id=42,
+        user_settings=us_42,
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
     )
@@ -388,6 +434,8 @@ def test_both_users_complete_flows_independently(tmp_path: Path) -> None:
         settings,
         database,
         guard,
+        telegram_user_id=43,
+        user_settings=us_43,
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
     )
@@ -462,7 +510,7 @@ def test_user_42_permit_cannot_be_reused_by_user_43(tmp_path: Path) -> None:
     permit_42 = _setup_vacancy_and_approve(database, "job-42", 42, now)
 
     # User 42 claims successfully
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     claim_42 = guard.claim(ApplicationPermission("job-42", permit_42, 42))
     assert claim_42.allowed
 
@@ -533,18 +581,20 @@ def test_approval_service_user_42_cannot_apply_for_user_43(tmp_path: Path) -> No
     database.request_approval(job_id="job-43", now=now, telegram_user_id=43)
 
     # User 42 tries to approve_and_apply for User 43's vacancy
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     page = ResumeTrackingPage(expected_resume="Resume FortyThree")
     client = HHClient(
         FakeContext(page),
         settings,
         database,
         guard,
+        telegram_user_id=42,
+        user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
     )
     service = ApprovalService(
-        settings,
+        load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         database,
         client,
         now_factory=lambda: now + timedelta(minutes=1),
@@ -634,7 +684,7 @@ def test_daily_limit_is_user_scoped(tmp_path: Path) -> None:
 
     # User 42 applies to a vacancy (completes full flow)
     permit_42 = _setup_vacancy_and_approve(database, "job-42", 42, now)
-    guard = ApprovalGuard(settings, database, now_factory=lambda: now + timedelta(minutes=2))
+    guard = ApprovalGuard(load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30), database, now_factory=lambda: now + timedelta(minutes=2))
     claim_42 = guard.claim(ApplicationPermission("job-42", permit_42, 42))
     assert claim_42.allowed
     database.complete_application("job-42", permit_42, success=True, now=now + timedelta(minutes=3))
@@ -642,3 +692,59 @@ def test_daily_limit_is_user_scoped(tmp_path: Path) -> None:
     # User 43 should have their own independent daily limit
     assert database.applied_today(now + timedelta(minutes=4), telegram_user_id=43) == 0
     assert database.applied_today(now + timedelta(minutes=4), telegram_user_id=42) == 1
+
+# ============================================================================
+# Stage 4\6 — per-user settings identity and isolation
+# ============================================================================
+
+def test_users_have_distinct_user_settings_instances(tmp_path: Path) -> None:
+    """User 42 and user 43 hold different UserSettings instances."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+
+    us_42 = load_user_settings(settings, max_applications_per_day=10)
+    us_43 = load_user_settings(settings, max_applications_per_day=10)
+
+    ctx_42 = create_runtime_context(42, settings, database, us_42)
+    ctx_43 = create_runtime_context(43, settings, database, us_43)
+
+    assert us_42 is not us_43
+    assert ctx_42.user_settings is us_42
+    assert ctx_43.user_settings is us_43
+
+
+def test_user_42_replace_does_not_affect_user_43(tmp_path: Path) -> None:
+    """Stage 4\6 acceptance: replace() for user 42 leaves user 43 intact."""
+    from dataclasses import replace as dc_replace
+
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+
+    ctx_42 = create_runtime_context(
+        42, settings, database,
+        load_user_settings(settings, max_applications_per_day=10),
+    )
+    ctx_43 = create_runtime_context(
+        43, settings, database,
+        load_user_settings(settings, max_applications_per_day=10),
+    )
+
+    ctx_42.user_settings = dc_replace(
+        ctx_42.user_settings,
+        app_mode="approval",
+        enable_real_apply=True,
+        max_applications_per_day=99,
+        check_interval_minutes=7,
+    )
+
+    assert ctx_42.user_settings.app_mode == "approval"
+    assert ctx_42.user_settings.enable_real_apply is True
+    assert ctx_42.user_settings.max_applications_per_day == 99
+    assert ctx_42.user_settings.check_interval_minutes == 7
+
+    assert ctx_43.user_settings.app_mode == "dry_run"
+    assert ctx_43.user_settings.enable_real_apply is False
+    assert ctx_43.user_settings.max_applications_per_day == 10
+    assert ctx_43.user_settings.check_interval_minutes == 30
