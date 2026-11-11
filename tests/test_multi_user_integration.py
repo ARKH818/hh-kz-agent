@@ -1,14 +1,10 @@
-"""
-Stage 3.8 — Integration multi-user regression test.
+"""Stage 3.8 multi-user isolation integration tests.
 
-Verifies that two different Telegram users can work with the system
-independently, without cross-contamination of data.
-
-Scenario:
-    User 42 → profile → resume → vacancy → approval → application
-    User 43 → profile → resume → vacancy → approval → application
-    Cross-user → attempt to use other user's data → REJECTED
+Verifies that per-user profiles, vacancies, approvals, resumes, daily limits,
+runtime contexts, pause/wake events, circuit-breaker state, and Telegram
+notification routing remain strictly isolated across telegram_user_id values.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -748,3 +744,686 @@ def test_user_42_replace_does_not_affect_user_43(tmp_path: Path) -> None:
     assert ctx_43.user_settings.enable_real_apply is False
     assert ctx_43.user_settings.max_applications_per_day == 10
     assert ctx_43.user_settings.check_interval_minutes == 30
+
+# ============================================================================
+# Phase 4.8 — multi-user runtime isolation integration tests
+# ============================================================================
+
+from hh_client import (
+    CompanyDetails,
+    PageState,
+    VacancyDetails,
+    VacancySearchResult,
+    VacancySummary,
+)
+from main import agent_loop, run_search_cycle
+from tg_bot import TelegramService
+
+
+class _Phase48FakeTelegram:
+    """Duck-typed Telegram surface used by run_search_cycle / agent_loop."""
+
+    def __init__(self) -> None:
+        self.previews: list[tuple[str, bool, int | None]] = []
+        self.notifications: list[tuple[str, int | None]] = []
+
+    async def send_preview(
+        self, vacancy, include_actions: bool, telegram_user_id: int | None = None
+    ):
+        self.previews.append((vacancy.id, include_actions, telegram_user_id))
+
+    async def notify(self, text: str, telegram_user_id: int | None = None):
+        self.notifications.append((text, telegram_user_id))
+
+    async def request_captcha(
+        self, screenshot, title: str, timeout_seconds: int, telegram_user_id: int | None = None
+    ):
+        return None
+
+
+class _Phase48FakeBot:
+    """Records every bot.send_message call for chat_id routing assertions."""
+
+    def __init__(self) -> None:
+        self.messages: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id: int, text: str, **kwargs):
+        self.messages.append((chat_id, text))
+
+
+class _Phase48SuccessHHClient:
+    """Completes a search cycle with zero vacancies; counts calls per instance."""
+
+    def __init__(self) -> None:
+        self.search_calls = 0
+
+    async def search_vacancies(self, query, areas, experience_filters):
+        self.search_calls += 1
+        return VacancySearchResult([], 0, 0)
+
+    async def read_vacancy(self, summary, captcha_solver=None):
+        return VacancyDetails(summary, PageState.VACANCY_LOADED, "Co", "desc")
+
+    async def check_messages(self, notify):
+        pass
+
+    async def read_company_details(self, company_url: str):
+        return CompanyDetails(None, None)
+
+
+class _Phase48ErroringHHClient:
+    """Always returns a search error (triggers consecutive_search_errors)."""
+
+    def __init__(self, error_reason: str = "network_error") -> None:
+        self.error_reason = error_reason
+        self.search_calls = 0
+
+    async def search_vacancies(self, query, areas, experience_filters):
+        self.search_calls += 1
+        return VacancySearchResult([], 0, 0, error_reason=self.error_reason)
+
+    async def read_vacancy(self, summary, captcha_solver=None):
+        return VacancyDetails(summary, PageState.NETWORK_ERROR, error="read failed")
+
+    async def check_messages(self, notify):
+        pass
+
+    async def read_company_details(self, company_url: str):
+        return CompanyDetails(None, None)
+
+
+
+class _Phase48ErroringBarrierHHClient:
+    """Erroring HHClient that parks on the *first* search_vacancies call only.
+
+    Subsequent calls return the error immediately so three consecutive failures
+    can still trip the circuit breaker after the concurrent barrier is released.
+    """
+
+    def __init__(
+        self,
+        *,
+        entered: asyncio.Event,
+        release: asyncio.Event,
+        error_reason: str = "network_error",
+    ) -> None:
+        self.entered = entered
+        self.release = release
+        self.error_reason = error_reason
+        self.search_calls = 0
+        self._barrier_pending = True
+
+    async def search_vacancies(self, query, areas, experience_filters):
+        self.search_calls += 1
+        if self._barrier_pending:
+            self._barrier_pending = False
+            self.entered.set()
+            await self.release.wait()
+        return VacancySearchResult([], 0, 0, error_reason=self.error_reason)
+
+    async def read_vacancy(self, summary, captcha_solver=None):
+        return VacancyDetails(summary, PageState.NETWORK_ERROR, error="read failed")
+
+    async def check_messages(self, notify):
+        pass
+
+    async def read_company_details(self, company_url: str):
+        return CompanyDetails(None, None)
+
+
+class _Phase48SuccessBarrierHHClient:
+    """Success HHClient that parks inside search_vacancies until release fires."""
+
+    def __init__(self, *, entered: asyncio.Event, release: asyncio.Event) -> None:
+        self.entered = entered
+        self.release = release
+        self.search_calls = 0
+
+    async def search_vacancies(self, query, areas, experience_filters):
+        self.search_calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return VacancySearchResult([], 0, 0)
+
+    async def read_vacancy(self, summary, captcha_solver=None):
+        return VacancyDetails(summary, PageState.VACANCY_LOADED, "Co", "desc")
+
+    async def check_messages(self, notify):
+        pass
+
+    async def read_company_details(self, company_url: str):
+        return CompanyDetails(None, None)
+
+class _Phase48BarrierHHClient:
+    """HHClient that parks inside search_vacancies until a shared release Event fires.
+
+    ``entered`` is set when the coroutine reaches the search call so a test can
+    wait until both users are simultaneously blocked at the barrier before
+    releasing them.
+    """
+
+    def __init__(
+        self,
+        *,
+        entered: asyncio.Event,
+        release: asyncio.Event,
+        summaries: list[VacancySummary],
+    ) -> None:
+        self.entered = entered
+        self.release = release
+        self.summaries = summaries
+        self.search_calls = 0
+
+    async def search_vacancies(self, query, areas, experience_filters):
+        self.search_calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return VacancySearchResult(
+            list(self.summaries),
+            found_results=len(self.summaries),
+            duplicates=0,
+        )
+
+    async def read_vacancy(self, summary, captcha_solver=None):
+        return VacancyDetails(
+            summary,
+            PageState.VACANCY_LOADED,
+            company=f"Company-{summary.id}",
+            description=f"Description for {summary.id}",
+        )
+
+    async def check_messages(self, notify):
+        pass
+
+    async def read_company_details(self, company_url: str):
+        return CompanyDetails(None, None)
+
+
+class _Phase48NullSender:
+    async def submit_application(self, permission) -> bool:
+        return False
+
+
+def _phase48_settings(tmp_path: Path):
+    """Settings with a profile that has at least one search query."""
+    from tests.test_config import VALID_ENV, write_profile
+
+    loaded = load_settings(
+        profile_path=write_profile(tmp_path),
+        environ={**VALID_ENV, "APP_MODE": "dry_run", "ENABLE_REAL_APPLY": "false"},
+    )
+    return replace(
+        loaded,
+        database_path=tmp_path / "agent.db",
+        min_seconds_between_actions=0,
+    )
+
+
+def _phase48_two_contexts(tmp_path: Path, *, check_interval_minutes: int = 1):
+    """Two independent runtime contexts with non-empty search queries."""
+    app_settings = _phase48_settings(tmp_path)
+    database = Database(app_settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=42, username="user42", now=NOW)
+    database.create_user(telegram_user_id=43, username="user43", now=NOW)
+
+    us_42 = load_user_settings(
+        app_settings, check_interval_minutes=check_interval_minutes
+    )
+    us_43 = load_user_settings(
+        app_settings, check_interval_minutes=check_interval_minutes
+    )
+    ctx_42 = create_runtime_context(42, app_settings, database, us_42)
+    ctx_43 = create_runtime_context(43, app_settings, database, us_43)
+    return app_settings, database, ctx_42, ctx_43
+
+
+def test_concurrent_runtime_contexts_isolation(tmp_path: Path) -> None:
+    """Phase 4.8: two agent_loops hit search concurrently behind a shared barrier.
+
+    Both HH clients park inside ``search_vacancies`` and set their own
+    ``entered`` Event. The test waits until *both* events are set (proving the
+    two searches overlap in time), then releases them. Each user gets a
+    distinct vacancy id; database rows must not cross-contaminate.
+    """
+    _, database, ctx_42, ctx_43 = _phase48_two_contexts(
+        tmp_path, check_interval_minutes=60
+    )
+    assert ctx_42.wake_event is not ctx_43.wake_event
+
+    entered_42 = asyncio.Event()
+    entered_43 = asyncio.Event()
+    release = asyncio.Event()
+
+    summary_42 = VacancySummary(
+        "job-only-42",
+        "Python role for user 42",
+        "https://example.com/vacancy/job-only-42",
+        "Python",
+    )
+    summary_43 = VacancySummary(
+        "job-only-43",
+        "Python role for user 43",
+        "https://example.com/vacancy/job-only-43",
+        "Python",
+    )
+
+    hh_42 = _Phase48BarrierHHClient(
+        entered=entered_42, release=release, summaries=[summary_42]
+    )
+    hh_43 = _Phase48BarrierHHClient(
+        entered=entered_43, release=release, summaries=[summary_43]
+    )
+    tg_42 = _Phase48FakeTelegram()
+    tg_43 = _Phase48FakeTelegram()
+    preview_42_done = asyncio.Event()
+    preview_43_done = asyncio.Event()
+
+    orig_preview_42 = tg_42.send_preview
+    orig_preview_43 = tg_43.send_preview
+
+    async def tracked_preview_42(vacancy, include_actions: bool, telegram_user_id: int | None = None):
+        await orig_preview_42(vacancy, include_actions, telegram_user_id)
+        if vacancy.id == "job-only-42":
+            preview_42_done.set()
+
+    async def tracked_preview_43(vacancy, include_actions: bool, telegram_user_id: int | None = None):
+        await orig_preview_43(vacancy, include_actions, telegram_user_id)
+        if vacancy.id == "job-only-43":
+            preview_43_done.set()
+
+    tg_42.send_preview = tracked_preview_42  # type: ignore[method-assign]
+    tg_43.send_preview = tracked_preview_43  # type: ignore[method-assign]
+
+    async def scenario() -> None:
+        task_42 = asyncio.create_task(agent_loop(ctx_42, hh_42, tg_42))
+        task_43 = asyncio.create_task(agent_loop(ctx_43, hh_43, tg_43))
+        try:
+            # Strict barrier: both users must be inside search_vacancies at once.
+            await asyncio.wait_for(
+                asyncio.gather(entered_42.wait(), entered_43.wait()),
+                timeout=5.0,
+            )
+            assert hh_42.search_calls >= 1
+            assert hh_43.search_calls >= 1
+            # Neither has returned from search yet — still concurrent.
+            assert not release.is_set()
+
+            release.set()
+
+            # Wait until each user finished processing their distinct vacancy.
+            await asyncio.wait_for(
+                asyncio.gather(preview_42_done.wait(), preview_43_done.wait()),
+                timeout=5.0,
+            )
+
+            ctx_42.paused = True
+            ctx_43.paused = True
+            ctx_42.wake_event.set()
+            ctx_43.wake_event.set()
+        finally:
+            for t in (task_42, task_43):
+                if not t.done():
+                    t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+
+    asyncio.run(scenario())
+
+    assert hh_42.search_calls >= 1
+    assert hh_43.search_calls >= 1
+
+    vac_42 = database.get("job-only-42", telegram_user_id=42)
+    vac_43 = database.get("job-only-43", telegram_user_id=43)
+    assert vac_42 is not None
+    assert vac_43 is not None
+    # Cross-user lookup must not return the other user's vacancy.
+    assert database.get("job-only-42", telegram_user_id=43) is None
+    assert database.get("job-only-43", telegram_user_id=42) is None
+
+    run_42 = database.latest_search_run(telegram_user_id=42)
+    run_43 = database.latest_search_run(telegram_user_id=43)
+    assert run_42 is not None and run_42.telegram_user_id == 42
+    assert run_43 is not None and run_43.telegram_user_id == 43
+    assert run_42.state == "completed"
+    assert run_43.state == "completed"
+    assert run_42.new_vacancies >= 1
+    assert run_43.new_vacancies >= 1
+
+    # Previews routed to the owning user only.
+    assert any(job_id == "job-only-42" and uid == 42 for job_id, _, uid in tg_42.previews)
+    assert any(job_id == "job-only-43" and uid == 43 for job_id, _, uid in tg_43.previews)
+    assert all(uid != 43 for _, _, uid in tg_42.previews)
+    assert all(uid != 42 for _, _, uid in tg_43.previews)
+
+
+def test_independent_paused_and_wake_events(tmp_path: Path) -> None:
+    """Phase 4.8: pause/resume of one user does not affect the other.
+
+    Recovery uses the real TelegramService.command('resume') path.
+    """
+    app_settings, database, ctx_42, ctx_43 = _phase48_two_contexts(
+        tmp_path, check_interval_minutes=60
+    )
+    hh_42 = _Phase48SuccessHHClient()
+    hh_43 = _Phase48SuccessHHClient()
+    tg_42 = _Phase48FakeTelegram()
+    tg_43 = _Phase48FakeTelegram()
+
+    # Wire real TelegramService only for the resume command surface.
+    approval = ApprovalService(
+        load_user_settings(app_settings), database, _Phase48NullSender()
+    )
+    bot_service = TelegramService(
+        app_settings,
+        database,
+        approval,
+        contexts={42: ctx_42, 43: ctx_43},
+        bot=object(),
+    )
+
+    cycle_43_before_resume = asyncio.Event()
+    cycle_42_after_resume = asyncio.Event()
+    cycle_43_after_resume = asyncio.Event()
+
+    orig_42 = hh_42.search_vacancies
+    orig_43 = hh_43.search_vacancies
+    searches_43 = {"n": 0}
+
+    async def tracked_42(*args, **kwargs):
+        result = await orig_42(*args, **kwargs)
+        if not ctx_42.paused:
+            cycle_42_after_resume.set()
+        return result
+
+    async def tracked_43(*args, **kwargs):
+        result = await orig_43(*args, **kwargs)
+        searches_43["n"] += 1
+        if searches_43["n"] == 1:
+            cycle_43_before_resume.set()
+        elif searches_43["n"] >= 2:
+            cycle_43_after_resume.set()
+        return result
+
+    hh_42.search_vacancies = tracked_42  # type: ignore[method-assign]
+    hh_43.search_vacancies = tracked_43  # type: ignore[method-assign]
+
+    # Start with user 42 already paused — only 43 should run a cycle first.
+    ctx_42.paused = True
+
+    async def scenario() -> None:
+        task_42 = asyncio.create_task(agent_loop(ctx_42, hh_42, tg_42))
+        task_43 = asyncio.create_task(agent_loop(ctx_43, hh_43, tg_43))
+        try:
+            await asyncio.wait_for(cycle_43_before_resume.wait(), timeout=5.0)
+            assert hh_42.search_calls == 0
+            assert hh_43.search_calls >= 1
+            assert ctx_42.paused is True
+            assert ctx_43.paused is False
+
+            # Real recovery path: /resume for user 42 only.
+            reply = bot_service.command("resume", 42)
+            assert reply == "Agent resumed."
+            assert ctx_42.paused is False
+            assert ctx_42.circuit_reason == ""
+            assert ctx_42.consecutive_search_errors == 0
+            # Force user 43's waiting loop to run another cycle so we can
+            # observe independence without relying on the long interval timer.
+            ctx_43.wake_event.set()
+
+            await asyncio.wait_for(
+                asyncio.gather(
+                    cycle_42_after_resume.wait(),
+                    cycle_43_after_resume.wait(),
+                ),
+                timeout=5.0,
+            )
+
+            ctx_42.paused = True
+            ctx_43.paused = True
+            ctx_42.wake_event.set()
+            ctx_43.wake_event.set()
+        finally:
+            for t in (task_42, task_43):
+                if not t.done():
+                    t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+
+    asyncio.run(scenario())
+
+    assert hh_42.search_calls >= 1
+    assert hh_43.search_calls >= 2
+    # Pause of 42 never flipped 43.
+    assert ctx_43.circuit_reason == ""
+
+
+def test_cross_user_error_and_recovery(tmp_path: Path) -> None:
+    """Phase 4.8: concurrent error accumulation on 42 while 43 succeeds.
+
+    User 42's three failing cycles and user 43's successful cycle run in the
+    same event loop. Concurrency is enforced with a shared barrier: both
+    users park inside ``search_vacancies`` (entered_42 / entered_43), the
+    test waits until both events are set, then releases them. After the
+    barrier, user 42 accumulates two more errors to trip the circuit-breaker.
+    Recovery uses the real ``TelegramService.command('resume', 42)`` path.
+    """
+    app_settings, database, ctx_42, ctx_43 = _phase48_two_contexts(
+        tmp_path, check_interval_minutes=60
+    )
+    entered_42 = asyncio.Event()
+    entered_43 = asyncio.Event()
+    release = asyncio.Event()
+
+    err_client = _Phase48ErroringBarrierHHClient(
+        entered=entered_42, release=release, error_reason="network_error"
+    )
+    ok_client = _Phase48SuccessBarrierHHClient(entered=entered_43, release=release)
+    tg_42 = _Phase48FakeTelegram()
+    tg_43 = _Phase48FakeTelegram()
+
+    approval = ApprovalService(
+        load_user_settings(app_settings), database, _Phase48NullSender()
+    )
+    bot_service = TelegramService(
+        app_settings,
+        database,
+        approval,
+        contexts={42: ctx_42, 43: ctx_43},
+        bot=object(),
+    )
+
+    async def failing_user_42() -> None:
+        # Three error cycles: the first parks at the barrier so that user 43
+        # can enter search concurrently; the remaining two run after release
+        # to accumulate the circuit-breaker threshold.
+        for _ in range(3):
+            if not ctx_42.paused:
+                await run_search_cycle(
+                    ctx_42, err_client, tg_42, now_factory=lambda: NOW
+                )
+
+    async def successful_user_43() -> None:
+        await run_search_cycle(ctx_43, ok_client, tg_43, now_factory=lambda: NOW)
+
+    async def scenario() -> None:
+        task_42 = asyncio.create_task(failing_user_42())
+        task_43 = asyncio.create_task(successful_user_43())
+        try:
+            # Strict barrier: both users must be inside search_vacancies together.
+            await asyncio.wait_for(
+                asyncio.gather(entered_42.wait(), entered_43.wait()),
+                timeout=5.0,
+            )
+            assert err_client.search_calls >= 1
+            assert ok_client.search_calls >= 1
+            assert not release.is_set()
+
+            release.set()
+            await asyncio.gather(task_42, task_43)
+        finally:
+            for t in (task_42, task_43):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+
+    asyncio.run(scenario())
+
+    assert ctx_42.paused is True
+    assert ctx_42.circuit_reason == "search_errors"
+    assert ctx_42.consecutive_search_errors >= 3
+
+    assert ctx_43.paused is False
+    assert ctx_43.circuit_reason == ""
+    assert ctx_43.consecutive_search_errors == 0
+    run_43 = database.latest_search_run(telegram_user_id=43)
+    assert run_43 is not None
+    assert run_43.state == "completed"
+    assert run_43.telegram_user_id == 43
+
+    # Real recovery for user 42.
+    reply = bot_service.command("resume", 42)
+    assert reply == "Agent resumed."
+    assert ctx_42.paused is False
+    assert ctx_42.circuit_reason == ""
+    assert ctx_42.consecutive_search_errors == 0
+
+    # After recovery, user 42 completes a successful cycle with a healthy client.
+    # Use a non-barrier success client so the post-recovery cycle is not blocked.
+    healthy_client = _Phase48SuccessHHClient()
+    run_42_ok = asyncio.run(
+        run_search_cycle(ctx_42, healthy_client, tg_42, now_factory=lambda: NOW)
+    )
+    assert run_42_ok.state == "completed"
+    assert ctx_42.paused is False
+    assert ctx_42.consecutive_search_errors == 0
+
+    # User 43 remains unaffected throughout.
+    assert ctx_43.paused is False
+    assert ctx_43.circuit_reason == ""
+    assert ctx_43.consecutive_search_errors == 0
+
+
+def test_database_and_notification_routing_isolation(tmp_path: Path) -> None:
+    """Phase 4.8: search_runs and real bot.send_message chat_id stay per-user.
+
+    Uses a single real ``TelegramService`` backed by ``_Phase48FakeBot`` so
+    that ``notify(..., telegram_user_id=N)`` is observed as
+    ``bot.send_message(chat_id=N, ...)``.
+
+    Concurrency is enforced with a shared barrier: the first erroring search of
+    user 42 and the successful search of user 43 both park inside
+    ``search_vacancies``. The test proceeds only after *both* ``entered`` Events
+    are set, proving the searches overlap, then releases them.
+    """
+    app_settings, database, ctx_42, ctx_43 = _phase48_two_contexts(
+        tmp_path, check_interval_minutes=60
+    )
+
+    entered_42 = asyncio.Event()
+    entered_43 = asyncio.Event()
+    release = asyncio.Event()
+
+    err_client = _Phase48ErroringBarrierHHClient(
+        entered=entered_42, release=release, error_reason="network_error"
+    )
+    ok_client = _Phase48SuccessBarrierHHClient(entered=entered_43, release=release)
+
+    fake_bot = _Phase48FakeBot()
+    approval = ApprovalService(
+        load_user_settings(app_settings), database, _Phase48NullSender()
+    )
+    # One shared TelegramService — production routing path via chat_id.
+    telegram = TelegramService(
+        app_settings,
+        database,
+        approval,
+        contexts={42: ctx_42, 43: ctx_43},
+        bot=fake_bot,
+    )
+
+    async def scenario() -> None:
+        async def fail_42() -> None:
+            # Three error cycles: the first one blocks at the barrier so that
+            # user 43 can enter search concurrently; the remaining two run
+            # after release to accumulate the circuit-breaker threshold.
+            for _ in range(3):
+                if not ctx_42.paused:
+                    await run_search_cycle(
+                        ctx_42, err_client, telegram, now_factory=lambda: NOW
+                    )
+
+        async def ok_43() -> None:
+            await run_search_cycle(
+                ctx_43, ok_client, telegram, now_factory=lambda: NOW
+            )
+
+        task_42 = asyncio.create_task(fail_42())
+        task_43 = asyncio.create_task(ok_43())
+        try:
+            # Strict barrier: both users must be inside search_vacancies together.
+            await asyncio.wait_for(
+                asyncio.gather(entered_42.wait(), entered_43.wait()),
+                timeout=5.0,
+            )
+            assert err_client.search_calls >= 1
+            assert ok_client.search_calls >= 1
+            assert not release.is_set()
+
+            release.set()
+            await asyncio.gather(task_42, task_43)
+        finally:
+            for t in (task_42, task_43):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+
+    asyncio.run(scenario())
+
+    run_42 = database.latest_search_run(telegram_user_id=42)
+    run_43 = database.latest_search_run(telegram_user_id=43)
+    assert run_42 is not None
+    assert run_43 is not None
+    assert run_42.telegram_user_id == 42
+    assert run_43.telegram_user_id == 43
+    assert run_42.state == "paused_by_circuit_breaker"
+    assert run_42.circuit_reason == "search_errors"
+    assert run_43.state == "completed"
+    assert run_43.circuit_reason == ""
+
+    # No cross-user DB leakage.
+    assert database.latest_search_run(telegram_user_id=42).state != "completed"
+    assert database.latest_search_run(telegram_user_id=43).state == "completed"
+
+    chat_ids = [chat_id for chat_id, _ in fake_bot.messages]
+    texts_by_chat: dict[int, list[str]] = {}
+    for chat_id, text in fake_bot.messages:
+        texts_by_chat.setdefault(chat_id, []).append(text)
+
+    # Circuit-breaker notification must be delivered with chat_id=42 only.
+    assert 42 in chat_ids
+    assert any(
+        "приостановлен" in text.lower() or "search_errors" in text
+        for text in texts_by_chat.get(42, [])
+    )
+    # User 43 must never receive user 42's circuit-breaker message.
+    assert all(
+        "search_errors" not in text and "приостановлен" not in text.lower()
+        for text in texts_by_chat.get(43, [])
+    )
+    # Successful empty cycle for 43 produces its own completion notify with chat_id=43.
+    assert 43 in chat_ids
+    assert any(
+        "цикл завершён" in text.lower() or "карточек" in text.lower()
+        for text in texts_by_chat.get(43, [])
+    )
