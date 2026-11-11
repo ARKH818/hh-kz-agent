@@ -236,7 +236,10 @@ async def run_search_cycle(
     target_user_id = context.telegram_user_id
     # Stage 4\6: user-specific behaviour comes from the per-user
     # configuration owned by this runtime context.
-    settings = context.user_settings
+    user_settings = context.user_settings
+    # Stage 4\7: circuit breaker thresholds are process-level settings,
+    # not per-user.  They live in the global Settings object.
+    global_settings = context.settings
     database = context.database
     now = now_factory or (lambda: datetime.now(UTC))
     started_at = now()
@@ -246,7 +249,7 @@ async def run_search_cycle(
     circuit_reason = ""
     failure: Exception | None = None
     logger.info(
-        "search_cycle_started queries=%s", len(settings.profile.hh.search_queries)
+        "search_cycle_started queries=%s", len(user_settings.profile.hh.search_queries)
     )
 
     async def process(summary: VacancySummary) -> None:
@@ -262,7 +265,7 @@ async def run_search_cycle(
             now_factory=now,
         )
         stats.record(result)
-        circuit_reason = stats.circuit_reason(settings)
+        circuit_reason = stats.circuit_reason(global_settings)
         if circuit_reason:
             state = "paused_by_circuit_breaker"
             context.paused = True
@@ -281,15 +284,15 @@ async def run_search_cycle(
                     vacancy.search_query,
                 )
             )
-        for query in settings.profile.hh.search_queries:
+        for query in user_settings.profile.hh.search_queries:
             if context.paused:
                 break
             logger.info("search_query_started query=%r", query)
 
             search = await hh_client.search_vacancies(
                 query,
-                settings.profile.hh.areas,
-                settings.profile.hh.experience_filters,
+                user_settings.profile.hh.areas,
+                user_settings.profile.hh.experience_filters,
             )
             stats.query_count += 1
             stats.found_results += search.found_results
@@ -311,7 +314,7 @@ async def run_search_cycle(
                 context.consecutive_search_errors = 0
             if (
                 context.consecutive_search_errors
-                >= settings.circuit_breaker_page_errors
+                >= global_settings.circuit_breaker_page_errors
             ):
                 circuit_reason = "search_errors"
                 state = "paused_by_circuit_breaker"

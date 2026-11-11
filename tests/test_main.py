@@ -5,6 +5,7 @@ import sys
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -379,3 +380,299 @@ def test_process_vacancy_uses_context_user_settings(tmp_path: Path) -> None:
 
     assert database.get("job-1", telegram_user_id=42).status is VacancyStatus.PENDING_APPROVAL
     assert telegram.previews == [("job-1", True, 42)]
+
+# ============================================================================
+# Stage 4\7 — run_search_cycle() user-specific error isolation
+# ============================================================================
+
+
+class ErroringHHClient:
+    """HHClient double that returns search errors to trigger circuit breaker."""
+
+    def __init__(self, error_reason: str = "network_error"):
+        self.error_reason = error_reason
+        self.search_calls = 0
+
+    async def search_vacancies(self, query, areas, experience_filters):
+        self.search_calls += 1
+        return VacancySearchResult([], 0, 0, error_reason=self.error_reason)
+
+    async def read_vacancy(self, summary, captcha_solver=None):
+        return VacancyDetails(summary, PageState.NETWORK_ERROR, error="read failed")
+
+    async def check_messages(self, notify):
+        pass
+
+    async def read_company_details(self, company_url: str):
+        return CompanyDetails(None, None)
+
+
+def _make_two_user_contexts(tmp_path: Path, mode: str = "dry_run"):
+    """Create two fully independent UserRuntimeContext objects."""
+    app_settings = settings(tmp_path, mode)
+    database = Database(app_settings.database_path)
+    database.init()
+
+    # Stage 4\7: register both users in the test DB so that
+    # search_runs.telegram_user_id FOREIGN KEY is satisfied.
+    database.create_user(telegram_user_id=42, username="user42", now=NOW)
+    database.create_user(telegram_user_id=43, username="user43", now=NOW)
+
+    us_a = load_user_settings(app_settings)
+    us_b = load_user_settings(app_settings)
+
+    ctx_a = create_runtime_context(42, app_settings, database, us_a)
+    ctx_b = create_runtime_context(43, app_settings, database, us_b)
+
+    return app_settings, database, ctx_a, ctx_b
+
+
+def test_run_search_cycle_error_counter_isolation(tmp_path: Path) -> None:
+    """Stage 4\7: search error increments only the failing user's counter."""
+    _, database, ctx_a, ctx_b = _make_two_user_contexts(tmp_path)
+    telegram_a = FakeTelegram()
+    telegram_b = FakeTelegram()
+    hh_client = ErroringHHClient("network_error")
+
+    # Run cycle for user A — enough errors to trigger counter
+    asyncio.run(
+        run_search_cycle(ctx_a, hh_client, telegram_a, now_factory=lambda: NOW)
+    )
+
+    # A accumulated errors; B untouched
+    assert ctx_a.consecutive_search_errors >= 1
+    assert ctx_b.consecutive_search_errors == 0
+    assert ctx_b.paused is False
+    assert ctx_b.circuit_reason == ""
+    assert ctx_b.next_run_at is None
+
+
+def test_run_search_cycle_circuit_breaker_isolation(tmp_path: Path) -> None:
+    """Stage 4\7: circuit breaker pauses only the failing user."""
+    _, database, ctx_a, ctx_b = _make_two_user_contexts(tmp_path)
+    telegram_a = FakeTelegram()
+    telegram_b = FakeTelegram()
+
+    # circuit_breaker_page_errors default = 3; run enough cycles for A
+    hh_client = ErroringHHClient("network_error")
+    for _ in range(3):
+        if not ctx_a.paused:
+            asyncio.run(
+                run_search_cycle(ctx_a, hh_client, telegram_a, now_factory=lambda: NOW)
+            )
+
+    # A is paused by circuit breaker
+    assert ctx_a.paused is True
+    assert ctx_a.circuit_reason == "search_errors"
+
+    # B is completely unaffected
+    assert ctx_b.paused is False
+    assert ctx_b.circuit_reason == ""
+    assert ctx_b.consecutive_search_errors == 0
+    assert ctx_b.next_run_at is None
+
+
+def test_run_search_cycle_notification_goes_to_correct_user(tmp_path: Path) -> None:
+    """Stage 4\7: circuit-breaker notification is sent only to the failing user."""
+    _, database, ctx_a, ctx_b = _make_two_user_contexts(tmp_path)
+    telegram_a = FakeTelegram()
+    telegram_b = FakeTelegram()
+
+    hh_client = ErroringHHClient("network_error")
+    for _ in range(3):
+        if not ctx_a.paused:
+            asyncio.run(
+                run_search_cycle(ctx_a, hh_client, telegram_a, now_factory=lambda: NOW)
+            )
+
+    # Notification sent to A
+    assert len(telegram_a.notifications) >= 1
+    notified_users = [uid for _, uid in telegram_a.notifications]
+    assert 42 in notified_users
+    assert 43 not in notified_users
+
+    # B received nothing
+    assert telegram_b.notifications == []
+
+
+def test_run_search_cycle_database_isolation(tmp_path: Path) -> None:
+    """Stage 4\7: failed search run is saved under the correct telegram_user_id."""
+    _, database, ctx_a, ctx_b = _make_two_user_contexts(tmp_path)
+    telegram_a = FakeTelegram()
+    telegram_b = FakeTelegram()
+
+    hh_client = ErroringHHClient("network_error")
+    for _ in range(3):
+        if not ctx_a.paused:
+            asyncio.run(
+                run_search_cycle(ctx_a, hh_client, telegram_a, now_factory=lambda: NOW)
+            )
+
+    # A has a saved search run with circuit_reason
+    run_a = database.latest_search_run(telegram_user_id=42)
+    assert run_a is not None
+    assert run_a.circuit_reason == "search_errors"
+    assert run_a.state == "paused_by_circuit_breaker"
+
+    # B has no search run at all
+    run_b = database.latest_search_run(telegram_user_id=43)
+    assert run_b is None
+
+
+# ============================================================================
+# Stage 4\7 — agent_loop() user-specific runtime isolation
+# ============================================================================
+
+
+class QuickHHClient:
+    """HHClient double that completes a cycle instantly with no results, tracking search calls."""
+
+    def __init__(self):
+        self.search_calls = 0
+
+    async def search_vacancies(self, query, areas, experience_filters):
+        self.search_calls += 1
+        return VacancySearchResult([], 0, 0)
+
+    async def read_vacancy(self, summary, captcha_solver=None):
+        return VacancyDetails(summary, PageState.VACANCY_LOADED, "Co", "desc")
+
+    async def check_messages(self, notify):
+        pass
+
+    async def read_company_details(self, company_url: str):
+        return CompanyDetails(None, None)
+
+
+def test_agent_loop_next_run_at_isolation(tmp_path: Path) -> None:
+    """Stage 4\7: agent_loop sets next_run_at only on its own context."""
+    _, database, ctx_a, ctx_b = _make_two_user_contexts(tmp_path)
+    telegram_a = FakeTelegram()
+    telegram_b = FakeTelegram()
+    hh_client = QuickHHClient()
+
+    next_run_set_event = asyncio.Event()
+    orig_wait = ctx_a.wake_event.wait
+    async def mock_wait():
+        next_run_set_event.set()
+        return await orig_wait()
+    ctx_a.wake_event.wait = mock_wait
+
+    async def scenario():
+        task_a = asyncio.create_task(
+            agent_loop(ctx_a, hh_client, telegram_a)
+        )
+
+        # Детерминированное ожидание момента входа в wake_event.wait(),
+        # что гарантирует, что следующий за ним по порядку в agent_loop() next_run_at уже установлен.
+        await asyncio.wait_for(next_run_set_event.wait(), timeout=2.0)
+
+        assert ctx_a.next_run_at is not None
+        assert ctx_b.next_run_at is None
+        assert hh_client.search_calls >= 1
+
+        task_a.cancel()
+        try:
+            await task_a
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    # После отмены задачи проверяется очистка next_run_at
+    assert ctx_a.next_run_at is None
+    assert ctx_b.next_run_at is None
+    assert ctx_b.paused is False
+    assert ctx_b.consecutive_search_errors == 0
+    assert not ctx_b.wake_event.is_set()
+
+
+def test_agent_loop_paused_isolation(tmp_path: Path) -> None:
+    """Stage 4\7: paused=True on A means no cycle; B is unaffected."""
+    _, database, ctx_a, ctx_b = _make_two_user_contexts(tmp_path)
+    telegram_a = FakeTelegram()
+    telegram_b = FakeTelegram()
+    hh_client = QuickHHClient()
+
+    ctx_a.paused = True
+
+    wake_awaited_event = asyncio.Event()
+    orig_wait = ctx_a.wake_event.wait
+    async def mock_wait():
+        wake_awaited_event.set()
+        return await orig_wait()
+    ctx_a.wake_event.wait = mock_wait
+
+    async def scenario():
+        task_a = asyncio.create_task(
+            agent_loop(ctx_a, hh_client, telegram_a)
+        )
+        # Дожидаемся начала ожидания через asyncio.wait_for() с timeout без подавления исключений
+        await asyncio.wait_for(wake_awaited_event.wait(), timeout=2.0)
+
+        task_a.cancel()
+        try:
+            await task_a
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    # A stayed paused (agent_loop does not unpause)
+    assert ctx_a.paused is True
+    assert hh_client.search_calls == 0
+    assert ctx_a.next_run_at is None
+
+    # B completely unaffected
+    assert ctx_b.paused is False
+    assert ctx_b.next_run_at is None
+    assert not ctx_b.wake_event.is_set()
+
+
+def test_agent_loop_wake_event_isolation(tmp_path: Path, monkeypatch) -> None:
+    """Stage 4\7: wake_event of A is independent from B."""
+    _, database, ctx_a, ctx_b = _make_two_user_contexts(tmp_path)
+    telegram_a = FakeTelegram()
+    telegram_b = FakeTelegram()
+    hh_client = QuickHHClient()
+
+    # Set A's wake event before starting the loop
+    ctx_a.wake_event.set()
+
+    search_cycle_calls = 0
+    second_cycle_started = asyncio.Event()
+
+    async def fake_run_search_cycle(context, hh_client, telegram, now_factory=None):
+        nonlocal search_cycle_calls
+        search_cycle_calls += 1
+        if search_cycle_calls == 2:
+            second_cycle_started.set()
+            await asyncio.Future()
+        return SimpleNamespace(
+            finished_at=datetime.now().isoformat()
+        )
+
+    monkeypatch.setattr(main_module, "run_search_cycle", fake_run_search_cycle)
+
+    async def scenario():
+        task_a = asyncio.create_task(
+            agent_loop(ctx_a, hh_client, telegram_a)
+        )
+        # Protective timeout only - wait until second run_search_cycle is entered
+        await asyncio.wait_for(second_cycle_started.wait(), timeout=2.0)
+
+        task_a.cancel()
+        try:
+            await task_a
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert search_cycle_calls == 2
+    # A's wake_event was consumed and cleared by agent_loop's finally block
+    assert not ctx_a.wake_event.is_set()
+    # B's wake_event is untouched
+    assert not ctx_b.wake_event.is_set()
+    assert ctx_b.next_run_at is None
+    assert ctx_b.paused is False

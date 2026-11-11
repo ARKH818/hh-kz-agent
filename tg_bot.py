@@ -61,7 +61,7 @@ class TelegramService:
         self.bot = bot or Bot(token=settings.tg_bot_token)
         self.dispatcher = dispatcher or Dispatcher()
         self.now_factory = now_factory or (lambda: datetime.now().astimezone())
-        self._captcha_future: asyncio.Future[str | None] | None = None
+        self._captcha_futures: dict[int, asyncio.Future[str | None]] = {}
         self.latest_release: ReleaseInfo | None = None
         self._notified_release_tag: str | None = None
         self._register_handlers()
@@ -150,8 +150,9 @@ class TelegramService:
         if name == "diagnostics":
             return self._diagnostics(user_id)
         if name == "cancel":
-            if self._captcha_future and not self._captcha_future.done():
-                self._captcha_future.set_result(None)
+            future = self._captcha_futures.get(user_id)
+            if future is not None and not future.done():
+                future.set_result(None)
             return "Current input request cancelled."
         return "Unknown command."
 
@@ -301,8 +302,9 @@ class TelegramService:
         text = message.text
         if text is None or text.startswith("/"):
             return
-        if self._captcha_future and not self._captcha_future.done():
-            self._captcha_future.set_result(text.strip())
+        future = self._captcha_futures.get(message.from_user.id)
+        if future is not None and not future.done():
+            future.set_result(text.strip())
             await message.answer("CAPTCHA input received.")
             return
 
@@ -446,18 +448,22 @@ class TelegramService:
     ) -> str | None:
         target_user_id = telegram_user_id
         loop = asyncio.get_running_loop()
-        self._captcha_future = loop.create_future()
-        await self.bot.send_photo(
-            chat_id=target_user_id,
-            photo=FSInputFile(screenshot),
-            caption="CAPTCHA detected for: " + title + "\nReply with the text or use /cancel.",
-        )
+        future = loop.create_future()
+        self._captcha_futures[target_user_id] = future
         try:
-            return await asyncio.wait_for(self._captcha_future, timeout_seconds)
+            await self.bot.send_photo(
+                chat_id=target_user_id,
+                photo=FSInputFile(screenshot),
+                caption="CAPTCHA detected for: " + title + "\nReply with the text or use /cancel.",
+            )
+            return await asyncio.wait_for(future, timeout_seconds)
         except TimeoutError:
             return None
         finally:
-            self._captcha_future = None
+            # Stage 4\7: remove only this user's entry, and only if it is
+            # still the same future — a newer request must not be dropped.
+            if self._captcha_futures.get(target_user_id) is future:
+                del self._captcha_futures[target_user_id]
 
     async def check_updates(self, notify: bool = True, telegram_user_id: int | None = None) -> ReleaseInfo | None:
         try:

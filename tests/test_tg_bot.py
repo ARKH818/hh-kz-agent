@@ -646,3 +646,201 @@ def test_status_shows_user_specific_mode(tmp_path: Path) -> None:
 
     status = telegram.command("status", user_id=42)
     assert "mode: approval" in status
+
+# ============================================================================
+# Stage 4\7 — CAPTCHA futures are isolated per telegram_user_id
+# ============================================================================
+
+
+class FakeBotWithPhotos(FakeBot):
+    def __init__(self, rich_error: Exception | None = None):
+        super().__init__(rich_error)
+        self.photos: list[dict] = []
+
+    async def send_photo(self, **kwargs):
+        self.photos.append(kwargs)
+
+
+def test_captcha_futures_are_independent_between_users(tmp_path: Path) -> None:
+    """Stage 4\7: two users can await CAPTCHA futures independently."""
+    telegram, _, _, bot = service(tmp_path)
+    bot = FakeBotWithPhotos()
+    telegram.bot = bot
+
+    async def scenario():
+        task_a = asyncio.create_task(
+            telegram.request_captcha(
+                Path("/tmp/captcha_a.png"), "Vacancy A", 60, telegram_user_id=42
+            )
+        )
+        task_b = asyncio.create_task(
+            telegram.request_captcha(
+                Path("/tmp/captcha_b.png"), "Vacancy B", 60, telegram_user_id=43
+            )
+        )
+        await asyncio.sleep(0)
+        # Both futures exist and are distinct
+        assert set(telegram._captcha_futures) == {42, 43}
+        assert telegram._captcha_futures[42] is not telegram._captcha_futures[43]
+
+        # Answer user 43 first — only their future resolves
+        telegram._captcha_futures[43].set_result("answer-b")
+        result_b = await task_b
+        assert result_b == "answer-b"
+        assert not task_a.done()
+
+        # Answer user 42
+        telegram._captcha_futures[42].set_result("answer-a")
+        result_a = await task_a
+        assert result_a == "answer-a"
+
+        # Both entries cleaned up
+        assert telegram._captcha_futures == {}
+
+    asyncio.run(scenario())
+
+
+def test_captcha_cancel_one_user_does_not_affect_other(tmp_path: Path) -> None:
+    """Stage 4\7: /cancel resolves only the caller's CAPTCHA future."""
+    telegram, _, _, bot = service(tmp_path)
+    bot = FakeBotWithPhotos()
+    telegram.bot = bot
+
+    async def scenario():
+        task_a = asyncio.create_task(
+            telegram.request_captcha(
+                Path("/tmp/captcha_a.png"), "Vacancy A", 60, telegram_user_id=42
+            )
+        )
+        task_b = asyncio.create_task(
+            telegram.request_captcha(
+                Path("/tmp/captcha_b.png"), "Vacancy B", 60, telegram_user_id=43
+            )
+        )
+        await asyncio.sleep(0)
+
+        # User 42 sends /cancel
+        reply = telegram.command("cancel", user_id=42)
+        assert reply == "Current input request cancelled."
+
+        # User 42's future resolved with None; user 43's still pending
+        result_a = await task_a
+        assert result_a is None
+        assert not task_b.done()
+        assert not telegram._captcha_futures[43].done()
+
+        # User 43 still able to answer
+        telegram._captcha_futures[43].set_result("answer-b")
+        assert await task_b == "answer-b"
+        assert telegram._captcha_futures == {}
+
+    asyncio.run(scenario())
+
+
+def test_captcha_text_answer_goes_to_correct_user(tmp_path: Path) -> None:
+    """Stage 4\7: a text reply resolves only the sender's CAPTCHA future."""
+    telegram, database, _, bot = service(tmp_path)
+    bot = FakeBotWithPhotos()
+    telegram.bot = bot
+
+    database.create_user(
+        telegram_user_id=43,
+        username="testuser43",
+        now=NOW,
+    )
+
+    async def scenario():
+        task_a = asyncio.create_task(
+            telegram.request_captcha(
+                Path("/tmp/captcha_a.png"), "Vacancy A", 60, telegram_user_id=42
+            )
+        )
+        task_b = asyncio.create_task(
+            telegram.request_captcha(
+                Path("/tmp/captcha_b.png"), "Vacancy B", 60, telegram_user_id=43
+            )
+        )
+        await asyncio.sleep(0)
+
+        # User 43 replies with the CAPTCHA text
+        user_43 = FakeUser(user_id=43)
+        message = FakeMessage(text="captcha-text-43", from_user=user_43)
+        await telegram._text_handler(message)
+        assert message.answer_text == "CAPTCHA input received."
+
+        # Only user 43's future resolved
+        assert await task_b == "captcha-text-43"
+        assert not task_a.done()
+        assert not telegram._captcha_futures[42].done()
+
+        telegram._captcha_futures[42].set_result("answer-a")
+        assert await task_a == "answer-a"
+        assert telegram._captcha_futures == {}
+
+    asyncio.run(scenario())
+
+
+def test_captcha_cleanup_removes_only_own_future(tmp_path: Path) -> None:
+    """Stage 4\7: cleanup of a finished request never drops a newer future."""
+    telegram, _, _, bot = service(tmp_path)
+    bot = FakeBotWithPhotos()
+    telegram.bot = bot
+
+    async def scenario():
+        # First request for user 42 finishes (timeout)
+        task_a = asyncio.create_task(
+            telegram.request_captcha(
+                Path("/tmp/captcha_a.png"), "Vacancy A", 1, telegram_user_id=42
+            )
+        )
+        # While it is still registered, a second request for the same user starts
+        await asyncio.sleep(0)
+        future_first = telegram._captcha_futures[42]
+        task_a2 = asyncio.create_task(
+            telegram.request_captcha(
+                Path("/tmp/captcha_a2.png"), "Vacancy A2", 60, telegram_user_id=42
+            )
+        )
+        await asyncio.sleep(0)
+        future_second = telegram._captcha_futures[42]
+        assert future_second is not future_first
+
+        # Let the first request time out
+        result = await task_a
+        assert result is None
+
+        # The newer future must survive cleanup of the old one
+        assert telegram._captcha_futures[42] is future_second
+
+        future_second.set_result("answer-a2")
+        assert await task_a2 == "answer-a2"
+        assert telegram._captcha_futures == {}
+
+    asyncio.run(scenario())
+
+
+def test_captcha_send_photo_error_cleans_up_future(tmp_path: Path) -> None:
+    """Stage 4\7: send_photo exception cleans up user's future and leaves others intact."""
+    telegram, _, _, _ = service(tmp_path)
+
+    class ErrorBot(FakeBot):
+        async def send_photo(self, **kwargs):
+            raise TelegramNetworkError(method=None, message="network error during send_photo")
+
+    telegram.bot = ErrorBot()
+
+    async def scenario():
+        other_future = asyncio.get_running_loop().create_future()
+        telegram._captcha_futures[43] = other_future
+
+        with pytest.raises(TelegramNetworkError):
+            await telegram.request_captcha(
+                Path("/tmp/captcha.png"), "Vacancy Error", 60, telegram_user_id=42
+            )
+
+        assert 42 not in telegram._captcha_futures
+        assert telegram._captcha_futures.get(43) is other_future
+
+        other_future.set_result("ok")
+
+    asyncio.run(scenario())
