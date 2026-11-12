@@ -9,6 +9,7 @@ from approval import ApplicationPermission, ApprovalGuard
 from config import load_settings, load_user_settings
 from database import Database
 from hh_client import HHClient, PageState, VacancySummary, classify_page
+from runtime_context import HHAccountOwnershipError
 from tests.test_config import VALID_ENV, write_profile
 from vacancy_filter import title_rejection_reason
 
@@ -862,3 +863,143 @@ def test_missing_resume_does_not_fall_back_to_global_profile(tmp_path: Path) -> 
 
     # The key assertion: no resume was selected because user has none
     assert "selected_resume:" not in str(page.actions)
+
+
+# ============================================================================
+# Phase 5.4 — HHClient ownership binding
+# ============================================================================
+
+
+def _ownership_settings(tmp_path: Path):
+    return replace(
+        load_settings(profile_path=write_profile(tmp_path), environ=VALID_ENV),
+        database_path=tmp_path / "agent.db",
+        min_seconds_between_actions=0,
+    )
+
+
+def _setup_hh_accounts(database: Database):
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_user(telegram_user_id=43, now=NOW)
+    account_42_id = database.create_hh_account(
+        telegram_user_id=42,
+        account_label="Account 42",
+        browser_profile_dir="profiles/user_42",
+        now=NOW,
+    )
+    account_43_id = database.create_hh_account(
+        telegram_user_id=43,
+        account_label="Account 43",
+        browser_profile_dir="profiles/user_43",
+        now=NOW,
+    )
+    account_42 = database.get_hh_account_by_id(account_42_id, 42)
+    account_43 = database.get_hh_account_by_id(account_43_id, 43)
+    assert account_42 is not None
+    assert account_43 is not None
+    return account_42, account_43
+
+
+def test_hh_client_accepts_verified_own_hh_account(tmp_path: Path) -> None:
+    """A database-backed account for the same Telegram user is bound."""
+    settings = _ownership_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+    user_settings = _approval_user_settings(settings)
+    guard = ApprovalGuard(user_settings, database, now_factory=lambda: NOW)
+
+    client = HHClient(
+        FakeContext(FakePage()),
+        settings,
+        database,
+        guard,
+        telegram_user_id=42,
+        user_settings=user_settings,
+        hh_account=account_42,
+    )
+
+    assert client.hh_account is not None
+    assert client.hh_account.id == account_42.id
+    assert client.hh_account.telegram_user_id == 42
+    assert client.approval_guard is guard
+    assert client.user_settings is user_settings
+
+
+def test_hh_client_loads_and_verifies_own_hh_account(tmp_path: Path) -> None:
+    """When no account is supplied, only the caller's own row is loaded."""
+    settings = _ownership_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+
+    client = HHClient(
+        FakeContext(FakePage()),
+        settings,
+        database,
+        ApprovalGuard(settings, database),
+        telegram_user_id=42,
+    )
+
+    assert client.hh_account is not None
+    assert client.hh_account.id == account_42.id
+    assert client.hh_account.telegram_user_id == 42
+
+
+def test_hh_client_rejects_another_users_hh_account(tmp_path: Path) -> None:
+    """User 42 cannot construct an HHClient bound to user 43's account."""
+    settings = _ownership_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    _, account_43 = _setup_hh_accounts(database)
+
+    with pytest.raises(HHAccountOwnershipError, match="does not belong"):
+        HHClient(
+            FakeContext(FakePage()),
+            settings,
+            database,
+            ApprovalGuard(settings, database),
+            telegram_user_id=42,
+            hh_account=account_43,
+        )
+
+
+def test_hh_client_rejects_forged_hh_account_id(tmp_path: Path) -> None:
+    """A forged id is rejected by the database ownership lookup."""
+    settings = _ownership_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, account_43 = _setup_hh_accounts(database)
+    forged = replace(account_42, id=account_43.id)
+
+    with pytest.raises(HHAccountOwnershipError, match="does not exist"):
+        HHClient(
+            FakeContext(FakePage()),
+            settings,
+            database,
+            ApprovalGuard(settings, database),
+            telegram_user_id=42,
+            hh_account=forged,
+        )
+
+
+def test_hh_client_rejects_forged_browser_profile(tmp_path: Path) -> None:
+    """The client refuses a profile path not stored on its account row."""
+    settings = _ownership_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+    forged = replace(
+        account_42,
+        browser_profile_dir="profiles/foreign-user",
+    )
+
+    with pytest.raises(HHAccountOwnershipError, match="browser profile"):
+        HHClient(
+            FakeContext(FakePage()),
+            settings,
+            database,
+            ApprovalGuard(settings, database),
+            telegram_user_id=42,
+            hh_account=forged,
+        )

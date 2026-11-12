@@ -130,6 +130,27 @@ def _as_utc(value: datetime) -> datetime:
 def _iso(value: datetime) -> str:
     return _as_utc(value).isoformat()
 
+
+_SQLITE_MAX_INTEGER = 2**63 - 1
+
+
+def _positive_sqlite_id(value: object) -> int | None:
+    """Return a positive SQLite row id, or ``None`` for invalid input.
+
+    Phase 5.4: identifiers must be real integers.  ``int(value)`` alone
+    is unsafe here because it silently truncates floats
+    (``int(1.9) == 1``) and normalises strings such as ``" 1 "`` or
+    ``"0x1"``, which could match an unrelated existing row.  Booleans
+    are rejected explicitly even though ``bool`` is an ``int`` subclass,
+    and values outside SQLite's signed 64-bit range cannot be bound.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value <= 0 or value > _SQLITE_MAX_INTEGER:
+        return None
+    return value
+
+
 class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -1092,6 +1113,35 @@ class Database:
         return self._hh_account(
             self.get_hh_account(telegram_user_id)
         )
+
+    def get_hh_account_by_id(
+        self,
+        hh_account_id: int,
+        telegram_user_id: int,
+    ) -> HHAccount | None:
+        """Return an HH account only when both identifiers own the row.
+
+        Phase 5.4: this is the database-level ownership lookup.  The
+        account id and the Telegram user id must identify the SAME
+        ``hh_accounts`` row.  A missing row, an invalid id, or an id
+        owned by another Telegram user returns ``None`` — never another
+        user's account.
+        """
+        account_id = _positive_sqlite_id(hh_account_id)
+        owner_id = _positive_sqlite_id(telegram_user_id)
+        if account_id is None or owner_id is None:
+            return None
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM hh_accounts
+                WHERE id = ? AND telegram_user_id = ?
+                """,
+                (account_id, owner_id),
+            ).fetchone()
+
+        return self._hh_account(row)
 
     def update_hh_account(
         self,

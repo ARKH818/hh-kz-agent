@@ -27,7 +27,7 @@ from main import (
     run_search_cycle,
 )
 from config import load_user_settings
-from runtime_context import create_runtime_context
+from runtime_context import HHAccountOwnershipError, create_runtime_context
 from tests.test_config import VALID_ENV, write_profile
 from tg_bot import TelegramService
 
@@ -740,11 +740,14 @@ def _install_account_run_fakes(
     *,
     login_error: Exception | None = None,
     agent_error: Exception | None = None,
+    events: list[str] | None = None,
 ) -> list[_AccountFakeBackend]:
     """Install fakes for run(): no real browser, Telegram or HH client."""
     backends: list[_AccountFakeBackend] = []
 
     def fake_create_browser_backend(settings_arg, profile_dir=None):
+        if events is not None:
+            events.append("backend_created")
         calls.setdefault("factory_calls", []).append(
             (settings_arg, profile_dir)
         )
@@ -762,13 +765,16 @@ def _install_account_run_fakes(
             telegram_user_id,
             *,
             user_settings=None,
+            hh_account=None,
         ):
             self.telegram_user_id = telegram_user_id
             self.user_settings = user_settings
+            self.hh_account = hh_account
             calls["hh_client_approval_guard"] = approval_guard
             calls["hh_client_telegram_user_id"] = telegram_user_id
             calls["hh_client_browser_context"] = browser_context
             calls["hh_client_user_settings"] = user_settings
+            calls["hh_client_hh_account"] = hh_account
 
         async def ensure_login(self):
             calls["ensure_login"] = True
@@ -797,6 +803,19 @@ def _install_account_run_fakes(
     monkeypatch.setattr(main_module, "HHClient", FakeHHClient)
     monkeypatch.setattr(main_module, "TelegramService", FakeTelegramService)
     monkeypatch.setattr(main_module, "agent_loop", fake_agent_loop)
+
+    original_create_runtime_context = main_module.create_runtime_context
+
+    def recording_create_runtime_context(*args, **kwargs):
+        if events is not None:
+            events.append("context_created")
+        return original_create_runtime_context(*args, **kwargs)
+
+    monkeypatch.setattr(
+        main_module,
+        "create_runtime_context",
+        recording_create_runtime_context,
+    )
     return backends
 
 
@@ -850,6 +869,9 @@ def test_run_initialises_and_saves_empty_profile_dir(
     assert backends[0].started == 1
     assert backends[0].closed == 1
     assert calls["hh_client_telegram_user_id"] == 42
+    assert calls["hh_client_hh_account"] is not None
+    assert calls["hh_client_hh_account"].id == account.id
+    assert calls["hh_client_hh_account"].telegram_user_id == 42
     assert calls["ensure_login"] is True
     assert calls["stopped_telegram"] is True
 
@@ -949,6 +971,143 @@ def test_run_does_not_start_browser_when_profile_save_fails(
 
     assert calls.get("factory_calls", []) == []
     assert backends == []
+    assert "started_polling" not in calls
+
+
+def test_run_rejects_foreign_hh_account_before_browser_creation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.4: user 42 cannot start a browser with user 43's account."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    backends = _install_account_run_fakes(monkeypatch, calls)
+
+    database = Database(app_settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_user(telegram_user_id=43, now=NOW)
+    foreign_account = database.get_or_create_hh_account(43, now=NOW)
+
+    monkeypatch.setattr(
+        Database,
+        "get_or_create_hh_account",
+        lambda self, telegram_user_id, now=None: foreign_account,
+    )
+
+    with pytest.raises(HHAccountOwnershipError, match="does not belong"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert calls.get("factory_calls", []) == []
+    assert backends == []
+    assert "ensure_login" not in calls
+    assert "started_polling" not in calls
+
+
+def test_run_rejects_forged_hh_account_id_before_browser_creation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.4: a forged account id never reaches backend creation."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    backends = _install_account_run_fakes(monkeypatch, calls)
+
+    database = Database(app_settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_user(telegram_user_id=43, now=NOW)
+    own_account = database.get_or_create_hh_account(42, now=NOW)
+    foreign_account = database.get_or_create_hh_account(43, now=NOW)
+    forged_account = replace(own_account, id=foreign_account.id)
+
+    monkeypatch.setattr(
+        Database,
+        "get_or_create_hh_account",
+        lambda self, telegram_user_id, now=None: forged_account,
+    )
+
+    with pytest.raises(HHAccountOwnershipError, match="does not exist"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert calls.get("factory_calls", []) == []
+    assert backends == []
+    assert "ensure_login" not in calls
+    assert "started_polling" not in calls
+
+
+def test_run_rejects_foreign_browser_profile_before_browser_startup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.4: a profile path not stored on the verified row is rejected."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    backends = _install_account_run_fakes(monkeypatch, calls)
+
+    database = Database(app_settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=42, now=NOW)
+    own_account = database.get_or_create_hh_account(42, now=NOW)
+    forged_account = replace(
+        own_account,
+        browser_profile_dir=str(tmp_path / "foreign-profile"),
+    )
+
+    monkeypatch.setattr(
+        Database,
+        "get_or_create_hh_account",
+        lambda self, telegram_user_id, now=None: forged_account,
+    )
+
+    with pytest.raises(HHAccountOwnershipError, match="browser profile"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert calls.get("factory_calls", []) == []
+    assert backends == []
+    assert "ensure_login" not in calls
+    assert "started_polling" not in calls
+
+
+def test_run_verifies_context_before_creating_browser_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.4: context ownership re-check precedes backend creation."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    events: list[str] = []
+    backends = _install_account_run_fakes(monkeypatch, calls, events=events)
+
+    asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert events == ["context_created", "backend_created"]
+    assert len(backends) == 1
+    assert backends[0].started == 1
+    assert calls["ensure_login"] is True
+
+
+def test_run_does_not_create_browser_when_context_check_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.4: a context ownership failure leaves no browser backend."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    backends = _install_account_run_fakes(monkeypatch, calls)
+
+    def rejecting_create_runtime_context(*args, **kwargs):
+        raise HHAccountOwnershipError(
+            "HH account does not belong to this Telegram user"
+        )
+
+    monkeypatch.setattr(
+        main_module,
+        "create_runtime_context",
+        rejecting_create_runtime_context,
+    )
+
+    with pytest.raises(HHAccountOwnershipError, match="does not belong"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert calls.get("factory_calls", []) == []
+    assert backends == []
+    assert "ensure_login" not in calls
     assert "started_polling" not in calls
 
 

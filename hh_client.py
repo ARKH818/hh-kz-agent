@@ -16,7 +16,8 @@ from uuid import uuid4
 
 from approval import ApplicationPermission, ApprovalGuard
 from config import Settings, UserSettings, load_user_settings
-from database import Database, VacancyStatus
+from database import Database, HHAccount, VacancyStatus
+from runtime_context import verify_hh_account_ownership
 from vacancy_filter import is_relevant_logistics_title
 
 
@@ -251,6 +252,7 @@ class HHClient:
         telegram_user_id: int,
         *,
         user_settings: UserSettings | None = None,
+        hh_account: HHAccount | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now_factory: Callable[[], datetime] | None = None,
     ):
@@ -259,6 +261,22 @@ class HHClient:
         self.database = database
         self.approval_guard = approval_guard
         self.telegram_user_id = telegram_user_id
+        # Phase 5.4: bind the client to the verified HH account.  A
+        # supplied account is checked against the database by BOTH its
+        # id and telegram_user_id; when omitted, only the caller's own
+        # database row is considered.  Legacy callers with no HH account
+        # row keep hh_account=None rather than silently borrowing one.
+        if hh_account is None:
+            hh_account = database.get_hh_account_model(telegram_user_id)
+        self.hh_account = (
+            verify_hh_account_ownership(
+                database,
+                telegram_user_id,
+                hh_account,
+            )
+            if hh_account is not None
+            else None
+        )
         # Stage 4\6: the per-user configuration shared with the owning
         # UserRuntimeContext (identity preserved).  When omitted (legacy
         # callers), materialise a FRESH snapshot from the immutable global

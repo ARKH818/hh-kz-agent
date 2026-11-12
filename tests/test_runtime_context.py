@@ -6,6 +6,7 @@ Does NOT test integration with agent loop or Telegram.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,7 +15,11 @@ import pytest
 from config import load_settings
 from database import Database
 from config import UserSettings, load_user_settings
-from runtime_context import UserRuntimeContext, create_runtime_context
+from runtime_context import (
+    HHAccountOwnershipError,
+    UserRuntimeContext,
+    create_runtime_context,
+)
 
 # Minimal environment for Settings — no global profile.yaml, no TG_USER_ID
 _MINIMAL_ENV = {
@@ -361,3 +366,151 @@ def test_context_loads_own_hh_account(tmp_path: Path) -> None:
     assert ctx_42.hh_account.telegram_user_id == 42
     assert ctx_43.hh_account.telegram_user_id == 43
     assert ctx_42.hh_account.account_label == "Account 42"
+
+
+# ============================================================================
+# Phase 5.4 — strict HH account ownership verification
+# ============================================================================
+
+
+def _two_hh_accounts(database: Database):
+    database.create_user(42)
+    database.create_user(43)
+    account_42_id = database.create_hh_account(
+        telegram_user_id=42,
+        account_label="Account 42",
+        browser_profile_dir="profiles/user_42",
+    )
+    account_43_id = database.create_hh_account(
+        telegram_user_id=43,
+        account_label="Account 43",
+        browser_profile_dir="profiles/user_43",
+    )
+    account_42 = database.get_hh_account_by_id(account_42_id, 42)
+    account_43 = database.get_hh_account_by_id(account_43_id, 43)
+    assert account_42 is not None
+    assert account_43 is not None
+    return account_42, account_43
+
+
+def test_context_accepts_verified_hh_account(tmp_path: Path) -> None:
+    """A database-backed account for the same user is accepted."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _two_hh_accounts(database)
+
+    ctx = create_runtime_context(
+        42, settings, database, hh_account=account_42
+    )
+
+    assert ctx.hh_account is not None
+    assert ctx.hh_account.id == account_42.id
+    assert ctx.hh_account.telegram_user_id == 42
+    assert ctx.hh_account.browser_profile_dir == "profiles/user_42"
+
+
+def test_context_rejects_hh_account_with_foreign_id(tmp_path: Path) -> None:
+    """An object carrying another account's id is rejected by the database."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, account_43 = _two_hh_accounts(database)
+    forged = replace(account_42, id=account_43.id)
+
+    with pytest.raises(HHAccountOwnershipError, match="does not exist"):
+        create_runtime_context(42, settings, database, hh_account=forged)
+
+
+def test_context_rejects_mismatched_owner(tmp_path: Path) -> None:
+    """An account object claiming another Telegram owner is rejected."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _two_hh_accounts(database)
+    forged = replace(account_42, telegram_user_id=43)
+
+    with pytest.raises(HHAccountOwnershipError, match="does not belong"):
+        create_runtime_context(42, settings, database, hh_account=forged)
+
+
+def test_context_rejects_mismatched_browser_profile(tmp_path: Path) -> None:
+    """A profile path that differs from the database row is rejected."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _two_hh_accounts(database)
+    forged = replace(
+        account_42,
+        browser_profile_dir="profiles/someone-else",
+    )
+
+    with pytest.raises(HHAccountOwnershipError, match="browser profile"):
+        create_runtime_context(42, settings, database, hh_account=forged)
+
+
+def test_context_rejects_invalid_hh_account_id(tmp_path: Path) -> None:
+    """Invalid account ids are handled safely and never match a row."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _two_hh_accounts(database)
+    forged = replace(account_42, id="not-an-id")  # type: ignore[arg-type]
+
+    with pytest.raises(HHAccountOwnershipError, match="does not exist"):
+        create_runtime_context(42, settings, database, hh_account=forged)
+
+
+def test_context_ownership_cannot_be_bypassed_by_reassignment(
+    tmp_path: Path,
+) -> None:
+    """Identity fields are immutable after construction."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, account_43 = _two_hh_accounts(database)
+
+    ctx = create_runtime_context(
+        42, settings, database, hh_account=account_42
+    )
+
+    with pytest.raises(AttributeError, match="cannot be changed"):
+        ctx.hh_account = account_43  # type: ignore[misc]
+    with pytest.raises(AttributeError, match="cannot be changed"):
+        ctx.telegram_user_id = 43  # type: ignore[misc]
+
+    assert ctx.hh_account is not None
+    assert ctx.hh_account.id == account_42.id
+    assert ctx.telegram_user_id == 42
+
+
+def test_context_nested_hh_account_cannot_be_mutated(tmp_path: Path) -> None:
+    """Mutating the bound HHAccount cannot bypass ownership verification.
+
+    ``HHAccount`` is a frozen dataclass, so the verified record stored on
+    the context cannot be edited in place (id, owner, or profile path).
+    A ``dataclasses.replace`` copy is a different object and therefore
+    cannot change what the context holds either.
+    """
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, account_43 = _two_hh_accounts(database)
+
+    ctx = create_runtime_context(
+        42, settings, database, hh_account=account_42
+    )
+    assert ctx.hh_account is not None
+
+    with pytest.raises(FrozenInstanceError):
+        ctx.hh_account.id = account_43.id  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        ctx.hh_account.telegram_user_id = 43  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        ctx.hh_account.browser_profile_dir = "profiles/user_43"  # type: ignore[misc]
+
+    forged = replace(ctx.hh_account, id=account_43.id)
+    assert forged.id == account_43.id
+    assert ctx.hh_account.id == account_42.id
+    assert ctx.hh_account.telegram_user_id == 42
+    assert ctx.hh_account.browser_profile_dir == "profiles/user_42"

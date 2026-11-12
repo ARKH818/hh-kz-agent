@@ -18,7 +18,7 @@ from approval import ApplicationPermission, ApprovalGuard, ApprovalService
 from config import load_settings, load_user_settings
 from database import Database, VacancyStatus
 from hh_client import HHClient
-from runtime_context import create_runtime_context
+from runtime_context import HHAccountOwnershipError, create_runtime_context
 
 # Re-use existing test helpers from test_hh_client.py
 from tests.test_hh_client import (
@@ -1427,3 +1427,129 @@ def test_database_and_notification_routing_isolation(tmp_path: Path) -> None:
         "цикл завершён" in text.lower() or "карточек" in text.lower()
         for text in texts_by_chat.get(43, [])
     )
+
+
+# ============================================================================
+# Phase 5.4 - HH account ownership verification (users A and B)
+# ============================================================================
+
+
+def test_phase54_ownership_isolation_with_separate_browser_profiles(
+    tmp_path: Path,
+) -> None:
+    """User A cannot borrow user B's account, profile, or client identity."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    now = NOW
+
+    _setup_user_with_profile_and_resume(database, 42, "Resume FortyTwo", now)
+    _setup_user_with_profile_and_resume(database, 43, "Resume FortyThree", now)
+
+    profile_42 = str(tmp_path / "browser-profiles" / "hh-account-42")
+    profile_43 = str(tmp_path / "browser-profiles" / "hh-account-43")
+    account_42_id = database.create_hh_account(
+        telegram_user_id=42,
+        account_label="Account 42",
+        browser_profile_dir=profile_42,
+        now=now,
+    )
+    account_43_id = database.create_hh_account(
+        telegram_user_id=43,
+        account_label="Account 43",
+        browser_profile_dir=profile_43,
+        now=now,
+    )
+    account_42 = database.get_hh_account_by_id(account_42_id, 42)
+    account_43 = database.get_hh_account_by_id(account_43_id, 43)
+    assert account_42 is not None
+    assert account_43 is not None
+    assert account_42.browser_profile_dir != account_43.browser_profile_dir
+
+    # A cannot attach B's account to its runtime context.
+    with pytest.raises(HHAccountOwnershipError, match="does not belong"):
+        create_runtime_context(
+            42, settings, database, hh_account=account_43
+        )
+
+    # A cannot borrow B's browser profile through a forged account copy.
+    forged_profile = replace(
+        account_42,
+        browser_profile_dir=account_43.browser_profile_dir,
+    )
+    with pytest.raises(HHAccountOwnershipError, match="browser profile"):
+        HHClient(
+            FakeContext(ResumeTrackingPage()),
+            settings,
+            database,
+            ApprovalGuard(settings, database),
+            telegram_user_id=42,
+            hh_account=forged_profile,
+        )
+
+    # A cannot construct an HHClient carrying B's account.
+    with pytest.raises(HHAccountOwnershipError, match="does not belong"):
+        HHClient(
+            FakeContext(ResumeTrackingPage()),
+            settings,
+            database,
+            ApprovalGuard(settings, database),
+            telegram_user_id=42,
+            hh_account=account_43,
+        )
+
+    # A's own client binds only A's account and profile.
+    us_42 = load_user_settings(
+        settings,
+        app_mode="approval",
+        enable_real_apply=True,
+        max_applications_per_day=10,
+        approval_ttl_minutes=30,
+    )
+    client_42 = HHClient(
+        FakeContext(ResumeTrackingPage()),
+        settings,
+        database,
+        ApprovalGuard(us_42, database, now_factory=lambda: now + timedelta(minutes=2)),
+        telegram_user_id=42,
+        user_settings=us_42,
+    )
+    assert client_42.hh_account is not None
+    assert client_42.hh_account.id == account_42.id
+    assert client_42.hh_account.telegram_user_id == 42
+    assert client_42.hh_account.browser_profile_dir == profile_42
+    assert client_42.hh_account.browser_profile_dir != profile_43
+
+    # B's normal workflow is unaffected.
+    permit_43 = _setup_vacancy_and_approve(database, "job-43", 43, now)
+    page_43 = ResumeTrackingPage(expected_resume="Resume FortyThree")
+    us_43 = load_user_settings(
+        settings,
+        app_mode="approval",
+        enable_real_apply=True,
+        max_applications_per_day=10,
+        approval_ttl_minutes=30,
+    )
+    client_43 = HHClient(
+        FakeContext(page_43),
+        settings,
+        database,
+        ApprovalGuard(us_43, database, now_factory=lambda: now + timedelta(minutes=2)),
+        telegram_user_id=43,
+        user_settings=us_43,
+        hh_account=account_43,
+        sleep=lambda _: asyncio.sleep(0),
+        now_factory=lambda: now + timedelta(minutes=3),
+    )
+    assert client_43.hh_account is not None
+    assert client_43.hh_account.id == account_43.id
+
+    result_43 = asyncio.run(
+        client_43.submit_application(
+            ApplicationPermission("job-43", permit_43, 43)
+        )
+    )
+
+    assert result_43 is True
+    assert "selected_resume:Resume FortyThree" in page_43.actions
+    assert database.get("job-43").status is VacancyStatus.APPLIED

@@ -1472,3 +1472,109 @@ def test_get_or_create_hh_account_is_idempotent(tmp_path: Path) -> None:
     assert second.account_label == "Primary account"
     assert second.browser_profile_dir == "profiles/user_42"
     assert second.status == "authorized"
+
+
+# =============================================================================
+# Phase 5.4: database-level HH account ownership lookup
+# =============================================================================
+
+
+def test_get_hh_account_by_id_requires_matching_owner(tmp_path: Path) -> None:
+    """Both the account id and Telegram user id must own the same row."""
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_user(telegram_user_id=99, now=NOW)
+    account_id = database.create_hh_account(
+        telegram_user_id=42,
+        account_label="alice",
+        browser_profile_dir="profiles/alice",
+        now=NOW,
+    )
+
+    account = database.get_hh_account_by_id(account_id, 42)
+
+    assert account is not None
+    assert isinstance(account, HHAccount)
+    assert account.id == account_id
+    assert account.telegram_user_id == 42
+    assert account.browser_profile_dir == "profiles/alice"
+
+
+def test_get_hh_account_by_id_rejects_wrong_telegram_user(tmp_path: Path) -> None:
+    """A valid account id must not leak an account to another user."""
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_user(telegram_user_id=99, now=NOW)
+    account_id = database.create_hh_account(
+        telegram_user_id=42,
+        account_label="alice",
+        now=NOW,
+    )
+
+    assert database.get_hh_account_by_id(account_id, 99) is None
+
+
+def test_get_hh_account_by_id_rejects_nonexistent_account(tmp_path: Path) -> None:
+    """A nonexistent account id never returns another user's row."""
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_hh_account(
+        telegram_user_id=42,
+        account_label="alice",
+        now=NOW,
+    )
+
+    assert database.get_hh_account_by_id(999_999, 42) is None
+
+
+@pytest.mark.parametrize(
+    "account_id",
+    [None, 0, -1, "", "not-an-id", True, False],
+)
+def test_get_hh_account_by_id_handles_invalid_ids_safely(
+    tmp_path: Path, account_id: object
+) -> None:
+    """Invalid ids are rejected without raising or matching a row."""
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_hh_account(
+        telegram_user_id=42,
+        account_label="alice",
+        now=NOW,
+    )
+
+    assert database.get_hh_account_by_id(account_id, 42) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "lookalike",
+    [
+        1.0,
+        1.9,
+        2.0,
+        "1",
+        "1.0",
+        "1.9",
+        " 1 ",
+        "+1",
+        "01",
+        b"1",
+        2**63,
+        10**100,
+    ],
+)
+def test_get_hh_account_by_id_rejects_non_integer_or_out_of_range_ids(
+    tmp_path: Path, lookalike: object
+) -> None:
+    """float/str/bytes lookalikes must never be truncated into a valid id."""
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    account_id = database.create_hh_account(
+        telegram_user_id=42,
+        account_label="alice",
+        now=NOW,
+    )
+
+    # Both identifier positions are validated independently.
+    assert database.get_hh_account_by_id(lookalike, 42) is None
+    assert database.get_hh_account_by_id(account_id, lookalike) is None

@@ -20,7 +20,11 @@ from config import ConfigError, Settings, load_settings, load_user_settings
 from database import Database, HHAccount, SearchRun, VacancyStatus
 from hh_client import HHClient, PageState, VacancySummary
 from logging_setup import configure_logging
-from runtime_context import UserRuntimeContext, create_runtime_context
+from runtime_context import (
+    UserRuntimeContext,
+    create_runtime_context,
+    verify_hh_account_ownership,
+)
 from tg_bot import TelegramService
 from vacancy_filter import title_rejection_reason
 from version import __version__
@@ -473,6 +477,14 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
         # hh_accounts.telegram_user_id foreign key.
         database.create_user(telegram_user_id=telegram_user_id)
         hh_account = database.get_or_create_hh_account(telegram_user_id)
+
+        # Phase 5.4: verify ownership before accessing the browser profile.
+        hh_account = verify_hh_account_ownership(
+            database,
+            telegram_user_id,
+            hh_account,
+        )
+
         profile_dir = _hh_account_profile_dir(settings, hh_account)
 
         if not hh_account.browser_profile_dir.strip():
@@ -489,37 +501,46 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
                     f"(Telegram user {telegram_user_id}). "
                     "Browser was not started."
                 )
+            # Reload the persisted database record and verify it again.
+            hh_account = database.get_hh_account_by_id(
+                hh_account.id,
+                telegram_user_id,
+            )
+            hh_account = verify_hh_account_ownership(
+                database,
+                telegram_user_id,
+                hh_account,
+            )
 
-        # Phase 5.3: each HHAccount gets its own persistent profile, so
-        # the existing Playwright/CloakBrowser persistent context keeps
-        # the HH.kz authorisation state on disk for this account only.
-        backend = create_browser_backend(settings, profile_dir=profile_dir)
-        browser_context = await backend.start()
-
-        # Stage 4\6: materialise the ONE per-user configuration instance.
-        # Every user-scoped component below shares this exact object.
+        # Materialise exactly one per-user settings instance.
         user_settings = load_user_settings(settings)
 
-        # Stage 4\4: legacy single-user agent loop with explicit
-        # telegram_user_id. Runtime control state lives inside the
-        # per-user UserRuntimeContext — no shared AgentControl.
-        # The context stores the very same UserSettings instance.
-        # The HHAccount is reloaded by the factory from the database,
-        # including the browser_profile_dir saved above.
+        # Phase 5.4: construct and verify the runtime context BEFORE
+        # creating or starting the browser backend.
         context = create_runtime_context(
             telegram_user_id=telegram_user_id,
             settings=settings,
             database=database,
             user_settings=user_settings,
+            hh_account=hh_account,
         )
+        if context.hh_account is None:
+            raise RuntimeError(
+                "Verified HH account is missing from runtime context."
+            )
 
-        # Stage 4\6: approval components share the user's single settings.
-        # HHClient requires this guard at construction time, so it must be
-        # created before the client (and before ensure_login()).
+        # Use only the profile path from the verified runtime context.
+        profile_dir = _hh_account_profile_dir(
+            settings,
+            context.hh_account,
+        )
+        backend = create_browser_backend(
+            settings,
+            profile_dir=profile_dir,
+        )
+        browser_context = await backend.start()
+
         guard = ApprovalGuard(context.user_settings, database)
-
-        # Stage 4\5: HHClient получает явный telegram_user_id через конструктор.
-        # Инвариант: hh_client.telegram_user_id == telegram_user_id
         hh_client = HHClient(
             browser_context,
             settings,
@@ -527,7 +548,9 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
             guard,
             telegram_user_id=telegram_user_id,
             user_settings=context.user_settings,
+            hh_account=context.hh_account,
         )
+
         if not await hh_client.ensure_login():
             raise RuntimeError(
                 "HH.kz login is required. Run with BROWSER_HEADLESS=false "
