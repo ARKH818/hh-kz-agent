@@ -156,16 +156,32 @@ class PlaywrightBrowserBackend:
                 pass
 
 
-def create_browser_backend(settings: Settings) -> BrowserBackend:
+def create_browser_backend(
+    settings: Settings,
+    profile_dir: Path | str | None = None,
+) -> BrowserBackend:
+    """Create the configured persistent-context browser backend.
+
+    Phase 5.3: an explicit ``profile_dir`` lets the caller select the
+    persistent profile owned by a specific HHAccount.  When it is not
+    supplied the previous behaviour (``settings.browser_profile_dir``)
+    is preserved for every existing caller.
+    """
+    selected_profile_dir = (
+        Path(profile_dir)
+        if profile_dir is not None
+        else settings.browser_profile_dir
+    )
+
     if settings.browser_backend == "cloakbrowser":
         return CloakBrowserBackend(
-            settings.browser_profile_dir,
+            selected_profile_dir,
             settings.browser_headless,
         )
 
     if settings.browser_backend == "playwright":
         return PlaywrightBrowserBackend(
-            settings.browser_profile_dir,
+            selected_profile_dir,
             settings.browser_headless,
         )
 

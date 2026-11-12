@@ -56,6 +56,47 @@ def test_factory_rejects_unknown_backend(tmp_path: Path) -> None:
         ("playwright", PlaywrightBrowserBackend),
     ],
 )
+def test_factory_uses_explicit_profile_dir(
+    tmp_path: Path, backend_name: str, backend_type: type
+) -> None:
+    """Phase 5.3: an explicit per-account profile directory is used as-is."""
+    explicit_profile = tmp_path / "accounts" / "hh-account-7"
+
+    backend = create_browser_backend(
+        settings(tmp_path, backend_name),
+        profile_dir=explicit_profile,
+    )
+
+    assert isinstance(backend, backend_type)
+    assert backend.profile_dir == explicit_profile
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "backend_type"),
+    [
+        ("cloakbrowser", CloakBrowserBackend),
+        ("playwright", PlaywrightBrowserBackend),
+    ],
+)
+def test_factory_without_profile_dir_preserves_settings_default(
+    tmp_path: Path, backend_name: str, backend_type: type
+) -> None:
+    """Phase 5.3: existing create_browser_backend(settings) callers are unchanged."""
+    app_settings = settings(tmp_path, backend_name)
+
+    backend = create_browser_backend(app_settings)
+
+    assert isinstance(backend, backend_type)
+    assert backend.profile_dir == app_settings.browser_profile_dir
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "backend_type"),
+    [
+        ("cloakbrowser", CloakBrowserBackend),
+        ("playwright", PlaywrightBrowserBackend),
+    ],
+)
 def test_persistent_profile_and_headless_are_passed_to_launcher(
     tmp_path: Path, backend_name: str, backend_type: type
 ) -> None:

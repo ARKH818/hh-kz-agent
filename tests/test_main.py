@@ -274,6 +274,35 @@ def test_main_run_passes_telegram_user_id_to_hh_client() -> None:
         "HHClient must be called with telegram_user_id in main.run()"
     )
 
+
+def test_main_run_passes_approval_guard_to_hh_client() -> None:
+    """Production main.run() must pass the required approval_guard.
+
+    HHClient.__init__ declares ``approval_guard`` as the fourth required
+    positional parameter.  This regression guard fails if the argument is
+    dropped again.
+    """
+    source = Path("main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    hh_client_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "HHClient"
+    ]
+
+    assert hh_client_calls, "main.py must call HHClient"
+
+    for call in hh_client_calls:
+        passes_approval_guard = len(call.args) >= 4 or any(
+            keyword.arg == "approval_guard" for keyword in call.keywords
+        )
+        assert passes_approval_guard, (
+            "HHClient must be called with approval_guard in main.run()"
+        )
+
 # ============================================================================
 # Stage 4\6 — one UserSettings instance per user across components
 # ============================================================================
@@ -676,3 +705,326 @@ def test_agent_loop_wake_event_isolation(tmp_path: Path, monkeypatch) -> None:
     assert not ctx_b.wake_event.is_set()
     assert ctx_b.next_run_at is None
     assert ctx_b.paused is False
+
+
+# ============================================================================
+# Phase 5.3 — per-HHAccount persistent browser profiles
+# ============================================================================
+
+
+def _account_settings(tmp_path: Path, mode: str = "dry_run"):
+    """Settings whose browser profiles live entirely inside tmp_path."""
+    return replace(
+        settings(tmp_path, mode),
+        browser_profile_dir=tmp_path / "browser-profiles",
+    )
+
+
+class _AccountFakeBackend:
+    def __init__(self) -> None:
+        self.started = 0
+        self.closed = 0
+        self.context = object()
+
+    async def start(self):
+        self.started += 1
+        return self.context
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+def _install_account_run_fakes(
+    monkeypatch,
+    calls: dict,
+    *,
+    login_error: Exception | None = None,
+    agent_error: Exception | None = None,
+) -> list[_AccountFakeBackend]:
+    """Install fakes for run(): no real browser, Telegram or HH client."""
+    backends: list[_AccountFakeBackend] = []
+
+    def fake_create_browser_backend(settings_arg, profile_dir=None):
+        calls.setdefault("factory_calls", []).append(
+            (settings_arg, profile_dir)
+        )
+        backend = _AccountFakeBackend()
+        backends.append(backend)
+        return backend
+
+    class FakeHHClient:
+        def __init__(
+            self,
+            browser_context,
+            settings_arg,
+            database_arg,
+            approval_guard,
+            telegram_user_id,
+            *,
+            user_settings=None,
+        ):
+            self.telegram_user_id = telegram_user_id
+            self.user_settings = user_settings
+            calls["hh_client_approval_guard"] = approval_guard
+            calls["hh_client_telegram_user_id"] = telegram_user_id
+            calls["hh_client_browser_context"] = browser_context
+            calls["hh_client_user_settings"] = user_settings
+
+        async def ensure_login(self):
+            calls["ensure_login"] = True
+            if login_error is not None:
+                raise login_error
+            return True
+
+    class FakeTelegramService:
+        def __init__(self, settings_arg, database_arg, approval_service, contexts):
+            calls["telegram_contexts"] = contexts
+
+        async def start_polling(self):
+            calls["started_polling"] = True
+
+        async def stop(self):
+            calls["stopped_telegram"] = True
+
+    async def fake_agent_loop(context, hh_client, telegram):
+        calls["agent_loop_user_id"] = context.telegram_user_id
+        if agent_error is not None:
+            raise agent_error
+
+    monkeypatch.setattr(
+        main_module, "create_browser_backend", fake_create_browser_backend
+    )
+    monkeypatch.setattr(main_module, "HHClient", FakeHHClient)
+    monkeypatch.setattr(main_module, "TelegramService", FakeTelegramService)
+    monkeypatch.setattr(main_module, "agent_loop", fake_agent_loop)
+    return backends
+
+
+def test_different_hh_accounts_get_different_profile_dirs(tmp_path: Path) -> None:
+    """Phase 5.3: profile directories are unique per HHAccount."""
+    app_settings = _account_settings(tmp_path)
+    database = Database(app_settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_user(telegram_user_id=43, now=NOW)
+
+    account_42 = database.get_or_create_hh_account(42, now=NOW)
+    account_43 = database.get_or_create_hh_account(43, now=NOW)
+
+    dir_42 = main_module._hh_account_profile_dir(app_settings, account_42)
+    dir_43 = main_module._hh_account_profile_dir(app_settings, account_43)
+
+    assert dir_42 != dir_43
+    assert dir_42 == (
+        app_settings.browser_profile_dir / f"hh-account-{account_42.id}"
+    )
+    assert dir_43 == (
+        app_settings.browser_profile_dir / f"hh-account-{account_43.id}"
+    )
+    assert app_settings.browser_profile_dir in dir_42.parents
+    assert app_settings.browser_profile_dir in dir_43.parents
+
+
+def test_run_initialises_and_saves_empty_profile_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.3: an empty browser_profile_dir is generated and persisted."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    backends = _install_account_run_fakes(monkeypatch, calls)
+
+    asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    database = Database(app_settings.database_path)
+    account = database.get_hh_account_model(42)
+    assert account is not None
+    assert account.browser_profile_dir
+    saved_path = Path(account.browser_profile_dir)
+    assert saved_path == (
+        app_settings.browser_profile_dir / f"hh-account-{account.id}"
+    )
+
+    assert len(calls["factory_calls"]) == 1
+    assert calls["factory_calls"][0][1] == saved_path
+    assert len(backends) == 1
+    assert backends[0].started == 1
+    assert backends[0].closed == 1
+    assert calls["hh_client_telegram_user_id"] == 42
+    assert calls["ensure_login"] is True
+    assert calls["stopped_telegram"] is True
+
+    from approval import ApprovalGuard
+
+    guard = calls["hh_client_approval_guard"]
+    assert isinstance(guard, ApprovalGuard)
+    assert guard.user_settings is calls["hh_client_user_settings"]
+    assert (
+        calls["telegram_contexts"][42].user_settings
+        is guard.user_settings
+    )
+
+
+def test_run_reuses_existing_profile_dir_without_overwriting(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.3: a stored profile path is reused and never rewritten."""
+    app_settings = _account_settings(tmp_path)
+    existing_path = tmp_path / "existing-account-profile"
+
+    database = Database(app_settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_hh_account(
+        telegram_user_id=42,
+        browser_profile_dir=str(existing_path),
+        now=NOW,
+    )
+    before = database.get_hh_account(42)
+    assert before is not None
+
+    calls: dict = {}
+    backends = _install_account_run_fakes(monkeypatch, calls)
+
+    asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    after = Database(app_settings.database_path).get_hh_account(42)
+    assert after is not None
+    assert after["browser_profile_dir"] == str(existing_path)
+    assert after["updated_at"] == before["updated_at"]
+    assert calls["factory_calls"][0][1] == existing_path
+    assert backends[0].started == 1
+    assert backends[0].closed == 1
+
+
+def test_repeated_run_uses_previously_saved_profile_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.3: restarting the agent keeps the same authorised profile."""
+    app_settings = _account_settings(tmp_path)
+
+    first_calls: dict = {}
+    _install_account_run_fakes(monkeypatch, first_calls)
+    asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    first_account = Database(
+        app_settings.database_path
+    ).get_hh_account_model(42)
+    assert first_account is not None
+    assert first_account.browser_profile_dir
+
+    second_calls: dict = {}
+    second_backends = _install_account_run_fakes(monkeypatch, second_calls)
+    asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    second_account = Database(
+        app_settings.database_path
+    ).get_hh_account_model(42)
+    assert second_account is not None
+    assert (
+        second_account.browser_profile_dir
+        == first_account.browser_profile_dir
+    )
+    assert second_calls["factory_calls"][0][1] == Path(
+        first_account.browser_profile_dir
+    )
+    assert second_backends[0].closed == 1
+
+
+def test_run_does_not_start_browser_when_profile_save_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.3: an unsaved profile path must never reach the browser."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    backends = _install_account_run_fakes(monkeypatch, calls)
+
+    monkeypatch.setattr(
+        Database,
+        "update_hh_account",
+        lambda self, telegram_user_id, **fields: False,
+    )
+
+    with pytest.raises(RuntimeError, match="Browser was not started"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert calls.get("factory_calls", []) == []
+    assert backends == []
+    assert "started_polling" not in calls
+
+
+def test_polling_only_does_not_create_browser_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.3: polling-only mode creates no HHAccount and no browser."""
+    app_settings = _account_settings(tmp_path)
+    started_polling: list[bool] = []
+    factory_calls: list[tuple] = []
+
+    def forbidden_factory(*args, **kwargs):
+        factory_calls.append((args, kwargs))
+        raise AssertionError("browser backend must not be created")
+
+    class FakeTelegramService:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start_polling(self):
+            started_polling.append(True)
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr(
+        main_module, "create_browser_backend", forbidden_factory
+    )
+    monkeypatch.setattr(main_module, "TelegramService", FakeTelegramService)
+
+    asyncio.run(main_module.run(app_settings, telegram_user_id=None))
+
+    assert factory_calls == []
+    assert started_polling == [True]
+
+    database = Database(app_settings.database_path)
+    assert database.get_hh_account(42) is None
+
+
+def test_backend_is_closed_when_login_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.3: the browser backend is closed even on startup errors."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    backends = _install_account_run_fakes(
+        monkeypatch,
+        calls,
+        login_error=RuntimeError("login failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="login failed"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert len(backends) == 1
+    assert backends[0].started == 1
+    assert backends[0].closed == 1
+    assert calls["ensure_login"] is True
+
+
+def test_backend_and_telegram_are_cleaned_up_when_agent_loop_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.3: normal cleanup runs when the agent loop raises."""
+    app_settings = _account_settings(tmp_path)
+    calls: dict = {}
+    backends = _install_account_run_fakes(
+        monkeypatch,
+        calls,
+        agent_error=RuntimeError("agent failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="agent failed"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert len(backends) == 1
+    assert backends[0].started == 1
+    assert backends[0].closed == 1
+    assert calls["stopped_telegram"] is True

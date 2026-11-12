@@ -17,7 +17,7 @@ from aiogram.exceptions import TelegramAPIError
 from approval import ApprovalGuard, ApprovalService
 from browser_backend import BrowserLaunchError, create_browser_backend
 from config import ConfigError, Settings, load_settings, load_user_settings
-from database import Database, SearchRun, VacancyStatus
+from database import Database, HHAccount, SearchRun, VacancyStatus
 from hh_client import HHClient, PageState, VacancySummary
 from logging_setup import configure_logging
 from runtime_context import UserRuntimeContext, create_runtime_context
@@ -415,18 +415,44 @@ async def agent_loop(
             context.next_run_at = None
 
 
+def _hh_account_profile_dir(
+    settings: Settings,
+    hh_account: HHAccount,
+) -> Path:
+    """Return the persistent browser profile directory for an HHAccount.
+
+    Phase 5.3: the path stored in the database always wins, so an already
+    initialised account keeps exactly the same browser profile between
+    restarts.  Only an empty value produces a new, stable path.  The
+    generated directory name is derived exclusively from the integer
+    HHAccount id and is therefore safe (no user-supplied text, no path
+    traversal) and unique per account.
+    """
+    stored = hh_account.browser_profile_dir.strip()
+    if stored:
+        return Path(stored)
+
+    account_id = int(hh_account.id)
+    if account_id <= 0:
+        raise RuntimeError(
+            "Cannot build a browser profile directory for HH account of "
+            f"Telegram user {hh_account.telegram_user_id}: invalid account id"
+        )
+
+    return Path(settings.browser_profile_dir) / f"hh-account-{account_id}"
+
+
 async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
     database = Database(settings.database_path)
     database.init()
-    backend = create_browser_backend(settings)
+    backend = None
     telegram: TelegramService | None = None
     try:
-        browser_context = await backend.start()
-
         if telegram_user_id is None:
             # Stage 4\3: polling-only mode. No user-specific runtime
             # components are created; the bot answers commands but no
-            # agent loop is started.
+            # agent loop is started.  Phase 5.3: no HHAccount, browser
+            # profile or browser backend is created in this mode.
             approval_service = ApprovalService(
                 settings.user_defaults, database, _NullSender()
             )
@@ -441,6 +467,35 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
             await telegram.start_polling()
             return
 
+        # Phase 5.3: the HHAccount must exist before the browser starts,
+        # because it owns the persistent browser profile directory.
+        # ``create_user`` is INSERT OR IGNORE and is required by the
+        # hh_accounts.telegram_user_id foreign key.
+        database.create_user(telegram_user_id=telegram_user_id)
+        hh_account = database.get_or_create_hh_account(telegram_user_id)
+        profile_dir = _hh_account_profile_dir(settings, hh_account)
+
+        if not hh_account.browser_profile_dir.strip():
+            # Persist BEFORE launching the browser.  Never run a browser
+            # with a path that was not stored, otherwise the authorisation
+            # state could silently be lost on the next start.
+            if not database.update_hh_account(
+                telegram_user_id,
+                browser_profile_dir=str(profile_dir),
+            ):
+                raise RuntimeError(
+                    "Failed to save the browser profile directory for "
+                    f"HH account {hh_account.id} "
+                    f"(Telegram user {telegram_user_id}). "
+                    "Browser was not started."
+                )
+
+        # Phase 5.3: each HHAccount gets its own persistent profile, so
+        # the existing Playwright/CloakBrowser persistent context keeps
+        # the HH.kz authorisation state on disk for this account only.
+        backend = create_browser_backend(settings, profile_dir=profile_dir)
+        browser_context = await backend.start()
+
         # Stage 4\6: materialise the ONE per-user configuration instance.
         # Every user-scoped component below shares this exact object.
         user_settings = load_user_settings(settings)
@@ -449,6 +504,8 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
         # telegram_user_id. Runtime control state lives inside the
         # per-user UserRuntimeContext — no shared AgentControl.
         # The context stores the very same UserSettings instance.
+        # The HHAccount is reloaded by the factory from the database,
+        # including the browser_profile_dir saved above.
         context = create_runtime_context(
             telegram_user_id=telegram_user_id,
             settings=settings,
@@ -456,12 +513,18 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
             user_settings=user_settings,
         )
 
+        # Stage 4\6: approval components share the user's single settings.
+        # HHClient requires this guard at construction time, so it must be
+        # created before the client (and before ensure_login()).
+        guard = ApprovalGuard(context.user_settings, database)
+
         # Stage 4\5: HHClient получает явный telegram_user_id через конструктор.
         # Инвариант: hh_client.telegram_user_id == telegram_user_id
         hh_client = HHClient(
             browser_context,
             settings,
             database,
+            guard,
             telegram_user_id=telegram_user_id,
             user_settings=context.user_settings,
         )
@@ -471,8 +534,6 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
                 "and sign in manually."
             )
 
-        # Stage 4\6: approval components share the user's single settings.
-        guard = ApprovalGuard(context.user_settings, database)
         approval_service = ApprovalService(context.user_settings, database, hh_client)
 
         telegram = TelegramService(
@@ -493,7 +554,8 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
             if telegram is not None:
                 await telegram.stop()
         finally:
-            await backend.close()
+            if backend is not None:
+                await backend.close()
 
 
 class _NullSender:
