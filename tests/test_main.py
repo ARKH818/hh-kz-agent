@@ -739,6 +739,7 @@ def _install_account_run_fakes(
     calls: dict,
     *,
     login_error: Exception | None = None,
+    login_result: bool = True,
     agent_error: Exception | None = None,
     events: list[str] | None = None,
 ) -> list[_AccountFakeBackend]:
@@ -778,9 +779,11 @@ def _install_account_run_fakes(
 
         async def ensure_login(self):
             calls["ensure_login"] = True
+            if events is not None:
+                events.append("login_checked")
             if login_error is not None:
                 raise login_error
-            return True
+            return login_result
 
     class FakeTelegramService:
         def __init__(self, settings_arg, database_arg, approval_service, contexts):
@@ -794,6 +797,8 @@ def _install_account_run_fakes(
 
     async def fake_agent_loop(context, hh_client, telegram):
         calls["agent_loop_user_id"] = context.telegram_user_id
+        if events is not None:
+            events.append("agent_loop_started")
         if agent_error is not None:
             raise agent_error
 
@@ -949,7 +954,72 @@ def test_repeated_run_uses_previously_saved_profile_dir(
     assert second_calls["factory_calls"][0][1] == Path(
         first_account.browser_profile_dir
     )
+    assert second_calls["ensure_login"] is True
     assert second_backends[0].closed == 1
+
+
+def test_run_does_not_start_agent_loop_without_confirmed_login(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.5: unconfirmed authorisation never reaches the agent loop."""
+    app_settings = replace(
+        _account_settings(tmp_path),
+        browser_headless=True,
+    )
+    calls: dict = {}
+    backends = _install_account_run_fakes(
+        monkeypatch,
+        calls,
+        login_result=False,
+    )
+
+    with pytest.raises(RuntimeError, match="headless mode"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    assert calls["ensure_login"] is True
+    assert "agent_loop_user_id" not in calls
+    assert "started_polling" not in calls
+    assert len(backends) == 1
+    assert backends[0].started == 1
+    assert backends[0].closed == 1
+
+
+def test_run_login_failure_keeps_profile_and_reports_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 5.5: failed login keeps the stored profile and starts nothing."""
+    app_settings = _account_settings(tmp_path)
+    database = Database(app_settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=42, now=NOW)
+    profile_dir = tmp_path / "authorised-profile"
+    database.create_hh_account(
+        telegram_user_id=42,
+        browser_profile_dir=str(profile_dir),
+        now=NOW,
+    )
+    profile_dir.mkdir(parents=True)
+    marker = profile_dir / "cookies.marker"
+    marker.write_text("preserved", encoding="utf-8")
+
+    calls: dict = {}
+    backends = _install_account_run_fakes(
+        monkeypatch,
+        calls,
+        login_result=False,
+    )
+
+    with pytest.raises(RuntimeError, match="not confirmed"):
+        asyncio.run(main_module.run(app_settings, telegram_user_id=42))
+
+    stored = database.get_hh_account(42)
+    assert stored is not None
+    assert stored["browser_profile_dir"] == str(profile_dir)
+    assert marker.read_text(encoding="utf-8") == "preserved"
+    assert calls.get("factory_calls", [])[0][1] == profile_dir
+    assert "agent_loop_user_id" not in calls
+    assert "started_polling" not in calls
+    assert backends[0].closed == 1
 
 
 def test_run_does_not_start_browser_when_profile_save_fails(
@@ -1077,7 +1147,12 @@ def test_run_verifies_context_before_creating_browser_backend(
 
     asyncio.run(main_module.run(app_settings, telegram_user_id=42))
 
-    assert events == ["context_created", "backend_created"]
+    assert events == [
+        "context_created",
+        "backend_created",
+        "login_checked",
+        "agent_loop_started",
+    ]
     assert len(backends) == 1
     assert backends[0].started == 1
     assert calls["ensure_login"] is True

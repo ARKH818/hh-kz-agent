@@ -8,7 +8,14 @@ import pytest
 from approval import ApplicationPermission, ApprovalGuard
 from config import load_settings, load_user_settings
 from database import Database
-from hh_client import HHClient, PageState, VacancySummary, classify_page
+from hh_client import (
+    HH_ACCOUNT_STATUS_AUTHORIZED,
+    HH_ACCOUNT_STATUS_LOGIN_REQUIRED,
+    HHClient,
+    PageState,
+    VacancySummary,
+    classify_page,
+)
 from runtime_context import HHAccountOwnershipError
 from tests.test_config import VALID_ENV, write_profile
 from vacancy_filter import title_rejection_reason
@@ -145,9 +152,37 @@ class FailingContext:
         raise RuntimeError("page creation failed")
 
 
-class RetryLoginPage(FakePage):
-    def __init__(self):
+class LoginPage(FakePage):
+    """Fake page exposing a URL and a set of visible selectors."""
+
+    def __init__(
+        self,
+        *,
+        url: str = "",
+        visible_selectors: tuple[str, ...] = (),
+    ):
         super().__init__()
+        self.url = url
+        self.visible_selectors = set(visible_selectors)
+        self.goto_urls: list[str] = []
+        self.closed = False
+
+    def locator(self, selector: str) -> FakeLocator:
+        return FakeLocator(selector in self.visible_selectors)
+
+    async def goto(self, url: str, **kwargs) -> None:
+        self.goto_urls.append(url)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class RetryLoginPage(LoginPage):
+    def __init__(self):
+        super().__init__(
+            url="https://hh.kz/applicant/resumes",
+            visible_selectors=('[data-qa="mainmenu_applicantProfile"]',),
+        )
         self.attempts = 0
 
     async def goto(self, url: str, **kwargs) -> None:
@@ -1003,3 +1038,218 @@ def test_hh_client_rejects_forged_browser_profile(tmp_path: Path) -> None:
             telegram_user_id=42,
             hh_account=forged,
         )
+
+
+# ============================================================================
+# Phase 5.5 - persistent session reuse and strict login verification
+# ============================================================================
+
+AUTHORIZED_PAGE_URL = "https://hh.kz/applicant/resumes"
+LOGIN_PAGE_URL = (
+    "https://hh.kz/account/login?backurl=%2Fapplicant%2Fresumes"
+)
+AUTHORIZED_MARKER = '[data-qa="mainmenu_applicantProfile"]'
+LOGIN_MARKER = 'input[type="tel"]'
+
+
+def _login_settings(tmp_path: Path, *, headless: bool = False):
+    return replace(
+        _ownership_settings(tmp_path),
+        browser_headless=headless,
+    )
+
+
+def _login_client(
+    database: Database,
+    settings,
+    account,
+    page: LoginPage,
+    *,
+    headless: bool = False,
+    now: datetime = NOW,
+    prompt=None,
+):
+    effective = replace(settings, browser_headless=headless)
+    user_settings = _approval_user_settings(effective)
+    return HHClient(
+        FakeContext(page),
+        effective,
+        database,
+        ApprovalGuard(user_settings, database, now_factory=lambda: now),
+        telegram_user_id=42,
+        user_settings=user_settings,
+        hh_account=account,
+        sleep=lambda _seconds: asyncio.sleep(0),
+        now_factory=lambda: now,
+        manual_login_prompt=prompt,
+    )
+
+
+def test_ensure_login_confirms_positive_authorization_signals(
+    tmp_path: Path,
+) -> None:
+    """A real authenticated page updates status and clears stale errors."""
+    settings = _login_settings(tmp_path, headless=True)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+    assert database.update_hh_account(
+        42,
+        status="disconnected",
+        last_error="stale error",
+    )
+    page = LoginPage(
+        url=AUTHORIZED_PAGE_URL,
+        visible_selectors=(AUTHORIZED_MARKER,),
+    )
+    client = _login_client(database, settings, account_42, page)
+
+    assert asyncio.run(client.ensure_login()) is True
+
+    stored = database.get_hh_account_model(42)
+    assert stored is not None
+    assert stored.status == HH_ACCOUNT_STATUS_AUTHORIZED
+    assert stored.last_checked_at == NOW.isoformat()
+    assert stored.last_error == ""
+    assert stored.last_login_at is None
+    assert page.closed is True
+
+
+def test_ensure_login_rejects_login_page_in_headless_mode(
+    tmp_path: Path,
+) -> None:
+    """An explicit login page is never accepted as an authorized session."""
+    settings = _login_settings(tmp_path, headless=True)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+    page = LoginPage(
+        url=LOGIN_PAGE_URL,
+        visible_selectors=(LOGIN_MARKER,),
+    )
+    client = _login_client(database, settings, account_42, page)
+
+    assert asyncio.run(client.ensure_login()) is False
+
+    stored = database.get_hh_account_model(42)
+    assert stored is not None
+    assert stored.status == HH_ACCOUNT_STATUS_LOGIN_REQUIRED
+    assert stored.last_checked_at == NOW.isoformat()
+    assert stored.last_error
+    assert stored.last_login_at is None
+    assert "password" not in stored.last_error.casefold()
+    assert "cookie" not in stored.last_error.casefold()
+
+
+def test_ensure_login_rejects_absence_of_login_indicators_as_unknown(
+    tmp_path: Path,
+) -> None:
+    """No login controls but also no positive marker is NOT a success."""
+    settings = _login_settings(tmp_path, headless=True)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+    page = LoginPage(url=AUTHORIZED_PAGE_URL)
+    client = _login_client(database, settings, account_42, page)
+
+    assert asyncio.run(client.ensure_login()) is False
+
+    stored = database.get_hh_account_model(42)
+    assert stored is not None
+    assert stored.status == HH_ACCOUNT_STATUS_LOGIN_REQUIRED
+    assert stored.last_error
+    assert stored.last_login_at is None
+    assert len(page.goto_urls) == 3
+
+
+def test_ensure_login_has_no_fake_page_bypass(tmp_path: Path) -> None:
+    """The old in-test bypass (fake context / test class name) is gone."""
+    settings = _login_settings(tmp_path, headless=True)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+    page = LoginPage(url=AUTHORIZED_PAGE_URL)
+    context = FakeContext(page)
+    context._is_fake = True  # type: ignore[attr-defined]
+    client = _login_client(database, settings, account_42, page)
+    client.context = context
+
+    assert asyncio.run(client.ensure_login()) is False
+    stored = database.get_hh_account_model(42)
+    assert stored is not None
+    assert stored.status == HH_ACCOUNT_STATUS_LOGIN_REQUIRED
+
+
+def test_manual_login_requires_positive_recheck(tmp_path: Path) -> None:
+    """Manual login is accepted only after a positive page re-check."""
+    settings = _login_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+    page = LoginPage(
+        url=LOGIN_PAGE_URL,
+        visible_selectors=(LOGIN_MARKER,),
+    )
+    prompts: list[str] = []
+
+    async def prompt(message: str) -> None:
+        prompts.append(message)
+        page.url = AUTHORIZED_PAGE_URL
+        page.visible_selectors = {AUTHORIZED_MARKER}
+
+    client = _login_client(
+        database,
+        settings,
+        account_42,
+        page,
+        headless=False,
+        prompt=prompt,
+    )
+
+    assert asyncio.run(client.ensure_login()) is True
+
+    assert len(prompts) == 1
+    stored = database.get_hh_account_model(42)
+    assert stored is not None
+    assert stored.status == HH_ACCOUNT_STATUS_AUTHORIZED
+    assert stored.last_login_at == NOW.isoformat()
+    assert stored.last_checked_at == NOW.isoformat()
+    assert stored.last_error == ""
+    assert page.url == AUTHORIZED_PAGE_URL
+
+
+def test_manual_login_without_positive_marker_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Pressing ENTER alone must not create a successful login record."""
+    settings = _login_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, _ = _setup_hh_accounts(database)
+    page = LoginPage(
+        url=LOGIN_PAGE_URL,
+        visible_selectors=(LOGIN_MARKER,),
+    )
+    prompts: list[str] = []
+
+    async def prompt(message: str) -> None:
+        prompts.append(message)
+
+    client = _login_client(
+        database,
+        settings,
+        account_42,
+        page,
+        headless=False,
+        prompt=prompt,
+    )
+
+    assert asyncio.run(client.ensure_login()) is False
+
+    assert len(prompts) == 1
+    stored = database.get_hh_account_model(42)
+    assert stored is not None
+    assert stored.status == HH_ACCOUNT_STATUS_LOGIN_REQUIRED
+    assert stored.last_login_at is None
+    assert stored.last_error
+    assert "authorization" in stored.last_error.casefold()

@@ -23,6 +23,50 @@ from vacancy_filter import is_relevant_logistics_title
 
 HH_BASE_URL = "https://hh.kz"
 
+# Phase 5.5: persisted HH account statuses used by the login verification.
+HH_ACCOUNT_STATUS_AUTHORIZED = "authorized"
+HH_ACCOUNT_STATUS_LOGIN_REQUIRED = "login_required"
+
+# Phase 5.5: authorisation is confirmed only by POSITIVE evidence.  These
+# are the page signals used to recognise an authenticated applicant area.
+# Several independent markers are checked so a minor HH.kz markup change
+# does not silently turn a real session into a false negative.
+LOGGED_IN_MARKERS = (
+    '[data-qa="mainmenu_applicantProfile"]',
+    '[data-qa="mainmenu_profile"]',
+    '[data-qa="mainmenu_resumes"]',
+    '[data-qa="mainmenu_negotiations"]',
+    '[data-qa="resume-title"]',
+    '[data-qa*="resume-title"]',
+    '[data-qa="resume-list"]',
+    'a[href^="/applicant/resumes"]',
+    'h1:has-text("Мои резюме")',
+)
+
+LOGIN_INDICATORS = (
+    'input[type="tel"]',
+    'input[data-qa*="login"]',
+    'a[data-qa="mainmenu_applicantAccess"]',
+    '[data-qa="account-login"]',
+    '[data-qa*="login-submit"]',
+    'a:has-text("Войти")',
+    'button:has-text("Войти")',
+)
+
+# Safe, secret-free error texts persisted to hh_accounts.last_error.
+SAFE_LOGIN_ERROR_HEADLESS = (
+    "HH.kz authorization is required and browser_headless is enabled"
+)
+SAFE_LOGIN_ERROR_UNVERIFIED = (
+    "HH.kz authorization could not be verified from the page state"
+)
+SAFE_LOGIN_ERROR_MANUAL = (
+    "HH.kz authorization was not confirmed after manual login"
+)
+SAFE_LOGIN_ERROR_NAVIGATION = (
+    "HH.kz login page could not be loaded"
+)
+
 logger = logging.getLogger(__name__)
 
 LOGISTICS_TITLE_KEYWORDS = (
@@ -62,6 +106,79 @@ def _is_logistics_query(query: str) -> bool:
 class QuestionnaireRequiredError(RuntimeError):
     """Employer questionnaire or test assignment required."""
     pass
+
+
+class LoginState(str, Enum):
+    """Outcome of a single HH.kz authorisation check.
+
+    Phase 5.5: ``UNKNOWN`` is a first-class outcome.  A page that could not
+    be loaded, changed its structure, or only lacks login indicators must
+    never be treated as an authenticated session.
+    """
+
+    AUTHORIZED = "authorized"
+    NOT_AUTHORIZED = "not_authorized"
+    UNKNOWN = "unknown"
+
+
+def _utc_iso(value: datetime) -> str:
+    """Return an ISO-8601 UTC timestamp for persisted account state."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
+
+
+def _page_url(page: Any) -> str:
+    """Read the current page URL without trusting a specific page class."""
+    try:
+        value = getattr(page, "url", "")
+        if callable(value):
+            value = value()
+        return str(value or "")
+    except Exception:
+        return ""
+
+
+def _is_login_url(url: str) -> bool:
+    parsed = urlparse(url)
+    path = parsed.path.casefold()
+    return any(
+        fragment in path
+        for fragment in ("/account/login", "/logon", "/auth/login", "/auth/")
+    )
+
+
+def _is_hh_url(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").casefold()
+    return hostname == "hh.kz" or hostname.endswith(".hh.kz") or (
+        hostname == "hh.ru" or hostname.endswith(".hh.ru")
+    )
+
+
+def _is_applicant_url(url: str) -> bool:
+    """True only for an authenticated-area URL on an HH host."""
+    if not _is_hh_url(url) or _is_login_url(url):
+        return False
+    return urlparse(url).path.casefold().startswith("/applicant")
+
+
+async def _any_visible(page: Any, selectors: tuple[str, ...]) -> bool:
+    """Return True when at least one selector is currently visible."""
+    for selector in selectors:
+        try:
+            if await page.locator(selector).first.is_visible():
+                return True
+        except Exception as exc:
+            logger.debug(
+                "hh_login_selector_check_failed selector=%s error=%s",
+                selector,
+                type(exc).__name__,
+            )
+    return False
+
+
+async def _console_manual_login_prompt(message: str) -> None:
+    await asyncio.to_thread(input, message)
 
 
 class PageState(str, Enum):
@@ -255,6 +372,7 @@ class HHClient:
         hh_account: HHAccount | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now_factory: Callable[[], datetime] | None = None,
+        manual_login_prompt: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.context = context
         self.settings = settings
@@ -286,14 +404,103 @@ class HHClient:
         )
         self.sleep = sleep
         self.now_factory = now_factory or (lambda: datetime.now(UTC))
+        self.manual_login_prompt = (
+            manual_login_prompt or _console_manual_login_prompt
+        )
 
     async def _delay(self) -> None:
         await self.sleep(
             self.settings.min_seconds_between_actions + random.uniform(0.5, 2.5)
         )
 
+    async def _authorization_state(self, page: Any) -> LoginState:
+        """Classify the current page as authorized, unauthorized or unknown.
+
+        Phase 5.5: authorisation requires a POSITIVE signal — an
+        authenticated applicant URL together with at least one visible
+        logged-in marker.  The absence of login controls is not enough,
+        and a page that cannot be inspected is reported as UNKNOWN.
+        """
+        try:
+            page_url = _page_url(page)
+
+            if _is_login_url(page_url):
+                return LoginState.NOT_AUTHORIZED
+
+            if await _any_visible(page, LOGGED_IN_MARKERS):
+                return (
+                    LoginState.AUTHORIZED
+                    if _is_applicant_url(page_url)
+                    else LoginState.UNKNOWN
+                )
+
+            if await _any_visible(page, LOGIN_INDICATORS):
+                return LoginState.NOT_AUTHORIZED
+
+            return LoginState.UNKNOWN
+        except Exception as exc:
+            logger.warning(
+                "hh_login_state_check_failed error=%s",
+                type(exc).__name__,
+            )
+            return LoginState.UNKNOWN
+
+    async def _manual_login(self, page: Any) -> bool:
+        """Wait for a human login, then re-run the strict page check."""
+        print("\n" + "=" * 60)
+        print("🔑 ТРЕБУЕТСЯ АВТОРИЗАЦИЯ НА HH.KZ")
+        print("1. В открывшемся окне браузера войдите в свой аккаунт HH.kz.")
+        print("2. После успешного входа вернитесь сюда и нажмите ENTER.")
+        print("=" * 60 + "\n")
+
+        try:
+            await self.manual_login_prompt(
+                "👉 Войдите на HH.kz в браузере и затем нажмите ENTER здесь: "
+            )
+        except (EOFError, OSError):
+            logger.error("hh_manual_login_prompt_unavailable")
+            return False
+
+        try:
+            await page.goto(
+                f"{HH_BASE_URL}/applicant/resumes",
+                wait_until="domcontentloaded",
+                timeout=90_000,
+            )
+            await self.sleep(2)
+        except Exception as exc:
+            logger.warning(
+                "hh_manual_login_navigation_failed error=%s",
+                type(exc).__name__,
+            )
+            return False
+
+        state = await self._authorization_state(page)
+        if state is not LoginState.AUTHORIZED:
+            logger.error(
+                "hh_manual_login_not_confirmed state=%s",
+                state.value,
+            )
+            return False
+
+        # Record a successful login only AFTER the page itself has been
+        # positively confirmed as authenticated.
+        self._mark_authorized(manual=True)
+        print("✅ Успешный вход на HH.kz! Запускаем работу агента...\n")
+        return True
+
     async def ensure_login(self) -> bool:
+        """Confirm an existing HH.kz session, allowing manual login if needed.
+
+        Phase 5.5: the persistent browser profile is reused as-is.  This
+        method never deletes cookies, local storage or other profile data.
+        It returns ``True`` only after a positive authorisation check, so
+        the caller can never start the agent loop on an unconfirmed
+        session.  Temporary navigation errors keep the existing retry
+        behaviour (three attempts with a delay).
+        """
         page = await self.context.new_page()
+        last_error = SAFE_LOGIN_ERROR_UNVERIFIED
         try:
             for attempt in range(1, 4):
                 try:
@@ -303,61 +510,101 @@ class HHClient:
                         timeout=90_000,
                     )
                     await self.sleep(2)
-                    login_indicators = page.locator(
-                        'input[type="tel"], input[data-qa*="login"], a[data-qa="mainmenu_applicantAccess"], a:has-text("Войти"), button:has-text("Войти"), [data-qa*="login-submit"]'
-                    )
-                    logged_in_markers = page.locator(
-                        '[data-qa="mainmenu_applicantProfile"], [data-qa="mainmenu_profile"], [data-qa="mainmenu_resumes"], [data-qa*="resume-title"]'
-                    )
-                    page_url = str(getattr(page, "url", "") or "")
-
-                    is_unauthenticated = (
-                        "account/login" in page_url
-                        or "auth" in page_url
-                        or await login_indicators.first.is_visible()
-                    )
-                    if not is_unauthenticated and await logged_in_markers.first.is_visible():
-                        return True
-
-                    if is_unauthenticated or not await logged_in_markers.first.is_visible():
-                        # If not clearly logged in
-                        if hasattr(self.context, "_is_fake") or "test" in str(type(page)):
-                            return True
-                        if self.settings.browser_headless:
-                            logger.error("hh_login_required headless=true")
-                            return False
-
-                        print("\n" + "=" * 60)
-                        print("🔑 ТРЕБУЕТСЯ АВТОРИЗАЦИЯ НА HH.KZ")
-                        print("1. В открывшемся окне браузера войдите в свой аккаунт HH.kz.")
-                        print("2. После успешного входа вернитесь сюда и нажмите ENTER.")
-                        print("=" * 60 + "\n")
-
-                        await asyncio.to_thread(
-                            input,
-                            "👉 Войдите на HH.kz в браузере и затем нажмите ENTER здесь: ",
-                        )
-                        await page.goto(
-                            f"{HH_BASE_URL}/applicant/resumes",
-                            wait_until="domcontentloaded",
-                            timeout=90_000,
-                        )
-                        await self.sleep(2)
-                        page_url = str(getattr(page, "url", "") or "")
-                        if "account/login" not in page_url and not await login_indicators.first.is_visible():
-                            print("✅ Успешный вход на HH.kz! Запускаем работу агента...\n")
-                            return True
-                        return False
-                    return True
+                    state = await self._authorization_state(page)
                 except Exception as exc:
+                    last_error = SAFE_LOGIN_ERROR_NAVIGATION
                     logger.warning(
-                        "hh_login_check_failed attempt=%s error=%s", attempt, exc
+                        "hh_login_check_failed attempt=%s error=%s",
+                        attempt,
+                        type(exc).__name__,
                     )
                     if attempt < 3:
                         await self.sleep(5)
+                    continue
+
+                if state is LoginState.AUTHORIZED:
+                    self._mark_authorized(manual=False)
+                    return True
+
+                if state is LoginState.NOT_AUTHORIZED:
+                    if self.settings.browser_headless:
+                        logger.error("hh_login_required headless=true")
+                        self._mark_login_required(
+                            SAFE_LOGIN_ERROR_HEADLESS
+                        )
+                        return False
+
+                    if await self._manual_login(page):
+                        return True
+
+                    self._mark_login_required(SAFE_LOGIN_ERROR_MANUAL)
+                    return False
+
+                last_error = SAFE_LOGIN_ERROR_UNVERIFIED
+                logger.warning(
+                    "hh_login_state_unknown attempt=%s", attempt
+                )
+                if attempt < 3:
+                    await self.sleep(5)
+
+            self._mark_login_required(last_error)
             return False
         finally:
             await page.close()
+
+    def _persist_account_state(self, fields: dict[str, str]) -> bool:
+        """Persist state for THIS client's verified HH account only.
+
+        Phase 5.5: writes are scoped by the authenticated Telegram user id.
+        A client whose identity no longer matches its verified account is
+        refused, so a forged ``telegram_user_id`` cannot update somebody
+        else's HH account.
+        """
+        account = self.hh_account
+        if account is None:
+            return False
+        if account.telegram_user_id != self.telegram_user_id:
+            logger.error(
+                "hh_account_state_update_blocked reason=ownership"
+            )
+            return False
+        try:
+            updated = self.database.update_hh_account(
+                self.telegram_user_id,
+                **fields,
+            )
+        except Exception as exc:
+            logger.warning(
+                "hh_account_state_update_failed error=%s",
+                type(exc).__name__,
+            )
+            return False
+        if not updated:
+            logger.warning(
+                "hh_account_state_update_failed reason=no_row"
+            )
+            return False
+        return True
+
+    def _mark_authorized(self, *, manual: bool) -> None:
+        timestamp = _utc_iso(self.now_factory())
+        fields = {
+            "status": HH_ACCOUNT_STATUS_AUTHORIZED,
+            "last_checked_at": timestamp,
+            "last_error": "",
+        }
+        if manual:
+            fields["last_login_at"] = timestamp
+        self._persist_account_state(fields)
+
+    def _mark_login_required(self, reason: str) -> None:
+        self._persist_account_state(
+            {
+                "status": HH_ACCOUNT_STATUS_LOGIN_REQUIRED,
+                "last_checked_at": _utc_iso(self.now_factory()),
+                "last_error": reason,
+            }
+        )
 
     async def _response_confirmed(self, page: Any, url: str) -> bool:
         try:

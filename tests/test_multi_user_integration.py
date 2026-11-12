@@ -22,7 +22,12 @@ from runtime_context import HHAccountOwnershipError, create_runtime_context
 
 # Re-use existing test helpers from test_hh_client.py
 from tests.test_hh_client import (
+    AUTHORIZED_MARKER,
+    AUTHORIZED_PAGE_URL,
+    LOGIN_MARKER,
+    LOGIN_PAGE_URL,
     FakeContext,
+    LoginPage,
     ResumeTrackingPage,
 )
 
@@ -1553,3 +1558,223 @@ def test_phase54_ownership_isolation_with_separate_browser_profiles(
     assert result_43 is True
     assert "selected_resume:Resume FortyThree" in page_43.actions
     assert database.get("job-43").status is VacancyStatus.APPLIED
+
+
+# ============================================================================
+# Phase 5.5 - persistent session reuse and login-state isolation
+# ============================================================================
+
+
+def _phase55_accounts(database: Database, tmp_path: Path):
+    """Create users, profiles and two separate HH accounts."""
+    _setup_user_with_profile_and_resume(database, 42, "Resume FortyTwo", NOW)
+    _setup_user_with_profile_and_resume(database, 43, "Resume FortyThree", NOW)
+    profile_42 = str(tmp_path / "browser-profiles" / "hh-account-42")
+    profile_43 = str(tmp_path / "browser-profiles" / "hh-account-43")
+    account_42_id = database.create_hh_account(
+        telegram_user_id=42,
+        account_label="Account 42",
+        browser_profile_dir=profile_42,
+        now=NOW,
+    )
+    account_43_id = database.create_hh_account(
+        telegram_user_id=43,
+        account_label="Account 43",
+        browser_profile_dir=profile_43,
+        now=NOW,
+    )
+    account_42 = database.get_hh_account_by_id(account_42_id, 42)
+    account_43 = database.get_hh_account_by_id(account_43_id, 43)
+    assert account_42 is not None
+    assert account_43 is not None
+    return account_42, account_43, profile_42, profile_43
+
+
+def _phase55_client(
+    settings,
+    database: Database,
+    account,
+    page: LoginPage,
+    *,
+    user_id: int,
+    headless: bool,
+    prompt=None,
+):
+    user_settings = load_user_settings(settings, app_mode="dry_run")
+    return HHClient(
+        FakeContext(page),
+        replace(settings, browser_headless=headless),
+        database,
+        ApprovalGuard(user_settings, database, now_factory=lambda: NOW),
+        telegram_user_id=user_id,
+        user_settings=user_settings,
+        hh_account=account,
+        sleep=lambda _seconds: asyncio.sleep(0),
+        now_factory=lambda: NOW,
+        manual_login_prompt=prompt,
+    )
+
+
+def test_phase55_login_state_isolation_between_accounts(
+    tmp_path: Path,
+) -> None:
+    """A successful login for A must not change B's HH account status."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, account_43, profile_42, profile_43 = _phase55_accounts(
+        database, tmp_path
+    )
+
+    page_42 = LoginPage(
+        url=AUTHORIZED_PAGE_URL,
+        visible_selectors=(AUTHORIZED_MARKER,),
+    )
+    client_42 = _phase55_client(
+        settings,
+        database,
+        account_42,
+        page_42,
+        user_id=42,
+        headless=True,
+    )
+    assert asyncio.run(client_42.ensure_login()) is True
+
+    stored_42 = database.get_hh_account_model(42)
+    stored_43 = database.get_hh_account_model(43)
+    assert stored_42 is not None
+    assert stored_43 is not None
+    assert stored_42.status == "authorized"
+    assert stored_42.last_checked_at is not None
+    assert stored_43.status == "disconnected"
+    assert stored_43.last_checked_at is None
+    assert stored_43.last_error == ""
+    assert stored_43.browser_profile_dir == profile_43
+    assert stored_42.browser_profile_dir == profile_42
+
+    checked_at_42 = stored_42.last_checked_at
+
+    page_43 = LoginPage(
+        url=LOGIN_PAGE_URL,
+        visible_selectors=(LOGIN_MARKER,),
+    )
+    client_43 = _phase55_client(
+        settings,
+        database,
+        account_43,
+        page_43,
+        user_id=43,
+        headless=True,
+    )
+    assert asyncio.run(client_43.ensure_login()) is False
+
+    after_42 = database.get_hh_account_model(42)
+    after_43 = database.get_hh_account_model(43)
+    assert after_42 is not None
+    assert after_43 is not None
+    assert after_43.status == "login_required"
+    assert after_43.last_error
+    assert after_43.last_login_at is None
+
+    # User A's confirmed state is untouched by user B's failure.
+    assert after_42.status == "authorized"
+    assert after_42.last_checked_at == checked_at_42
+    assert after_42.last_error == ""
+    assert after_42.browser_profile_dir == profile_42
+
+
+def test_phase55_profile_reuse_for_a_does_not_touch_b(
+    tmp_path: Path,
+) -> None:
+    """Reusing A's persistent profile leaves B's account row unchanged."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, account_43, profile_42, _ = _phase55_accounts(
+        database, tmp_path
+    )
+    before_43 = dict(database.get_hh_account(43) or {})
+
+    page_42 = LoginPage(
+        url=AUTHORIZED_PAGE_URL,
+        visible_selectors=(AUTHORIZED_MARKER,),
+    )
+    client_42 = _phase55_client(
+        settings,
+        database,
+        account_42,
+        page_42,
+        user_id=42,
+        headless=True,
+    )
+    assert asyncio.run(client_42.ensure_login()) is True
+
+    after_43 = dict(database.get_hh_account(43) or {})
+    assert after_43 == before_43
+    assert after_43["browser_profile_dir"] != profile_42
+
+    stored_42 = database.get_hh_account_model(42)
+    assert stored_42 is not None
+    assert stored_42.browser_profile_dir == profile_42
+    assert stored_42.status == "authorized"
+    assert account_43.browser_profile_dir == after_43["browser_profile_dir"]
+
+
+def test_phase55_cannot_update_another_users_account_with_forged_identity(
+    tmp_path: Path,
+) -> None:
+    """Forged ids or Telegram user ids must never update B's HH account."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, account_43, profile_42, _ = _phase55_accounts(
+        database, tmp_path
+    )
+
+    # A valid account id in the wrong ownership position is not found.
+    assert database.get_hh_account_by_id(account_43.id, 42) is None
+
+    # A write scoped to user 42 does not touch user 43.
+    before_43 = dict(database.get_hh_account(43) or {})
+    assert database.update_hh_account(
+        42,
+        status="authorized",
+        last_error="",
+    )
+    after_43 = dict(database.get_hh_account(43) or {})
+    assert after_43 == before_43
+
+    # A client cannot be re-pointed at another user after construction.
+    page_42 = LoginPage(url=AUTHORIZED_PAGE_URL)
+    client = _phase55_client(
+        settings,
+        database,
+        account_42,
+        page_42,
+        user_id=42,
+        headless=True,
+    )
+    client.telegram_user_id = 43
+    assert client._persist_account_state(
+        {"status": "authorized", "last_error": ""}
+    ) is False
+    assert dict(database.get_hh_account(43) or {}) == before_43
+
+    # A client for user 42 cannot be constructed with user 43's account.
+    with pytest.raises(HHAccountOwnershipError, match="does not belong"):
+        HHClient(
+            FakeContext(LoginPage(url=AUTHORIZED_PAGE_URL)),
+            settings,
+            database,
+            ApprovalGuard(
+                load_user_settings(settings), database
+            ),
+            telegram_user_id=42,
+            hh_account=account_43,
+        )
+
+    # A's own stored account still owns A's profile.
+    stored_42 = database.get_hh_account_model(42)
+    assert stored_42 is not None
+    assert stored_42.telegram_user_id == 42
+    assert stored_42.browser_profile_dir == profile_42

@@ -116,6 +116,70 @@ def test_persistent_profile_and_headless_are_passed_to_launcher(
     assert context.closed
 
 
+@pytest.mark.parametrize(
+    ("backend_name", "backend_type"),
+    [
+        ("cloakbrowser", CloakBrowserBackend),
+        ("playwright", PlaywrightBrowserBackend),
+    ],
+)
+def test_repeated_start_reuses_profile_without_relaunch(
+    tmp_path: Path, backend_name: str, backend_type: type
+) -> None:
+    """Phase 5.5: start() is idempotent and never creates a second profile."""
+    calls: list[tuple[Path, bool]] = []
+    context = FakeContext()
+
+    async def launcher(profile_dir: Path, *, headless: bool):
+        calls.append((Path(profile_dir), headless))
+        return context
+
+    profile = tmp_path / "account-profile"
+    backend = backend_type(profile, False, launcher=launcher)
+
+    first = asyncio.run(backend.start())
+    second = asyncio.run(backend.start())
+
+    assert first is context
+    assert second is context
+    assert calls == [(profile, False)]
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "backend_type"),
+    [
+        ("cloakbrowser", CloakBrowserBackend),
+        ("playwright", PlaywrightBrowserBackend),
+    ],
+)
+def test_restart_reuses_same_profile_and_preserves_its_contents(
+    tmp_path: Path, backend_name: str, backend_type: type
+) -> None:
+    """Phase 5.5: a restart uses the same directory and deletes nothing."""
+    calls: list[tuple[Path, bool]] = []
+    contexts = [FakeContext(), FakeContext()]
+
+    async def launcher(profile_dir: Path, *, headless: bool):
+        calls.append((Path(profile_dir), headless))
+        return contexts[len(calls) - 1]
+
+    profile = tmp_path / "account-profile"
+    profile.mkdir()
+    marker = profile / "cookies.marker"
+    marker.write_text("persisted-session", encoding="utf-8")
+
+    backend = backend_type(profile, True, launcher=launcher)
+    asyncio.run(backend.start())
+    asyncio.run(backend.close())
+    asyncio.run(backend.start())
+    asyncio.run(backend.close())
+
+    assert calls == [(profile, True), (profile, True)]
+    assert marker.read_text(encoding="utf-8") == "persisted-session"
+    assert contexts[0].closed is True
+    assert contexts[1].closed is True
+
+
 def test_cloakbrowser_launch_error_is_actionable(tmp_path: Path) -> None:
     async def broken_launcher(profile_dir: Path, *, headless: bool):
         raise RuntimeError("binary blocked")

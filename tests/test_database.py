@@ -1578,3 +1578,78 @@ def test_get_hh_account_by_id_rejects_non_integer_or_out_of_range_ids(
     # Both identifier positions are validated independently.
     assert database.get_hh_account_by_id(lookalike, 42) is None
     assert database.get_hh_account_by_id(account_id, lookalike) is None
+
+
+# =============================================================================
+# Phase 5.5: persisted HH account authorisation state
+# =============================================================================
+
+
+def test_update_hh_account_persists_authorization_state(tmp_path: Path) -> None:
+    """Existing state columns round-trip through the typed model."""
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_hh_account(
+        telegram_user_id=42,
+        account_label="alice",
+        now=NOW,
+    )
+
+    assert database.update_hh_account(
+        42,
+        status="authorized",
+        last_login_at="2026-07-30T12:00:00+00:00",
+        last_checked_at="2026-07-30T12:05:00+00:00",
+        last_error="",
+    )
+
+    account = database.get_hh_account_model(42)
+    assert account is not None
+    assert account.status == "authorized"
+    assert account.last_login_at == "2026-07-30T12:00:00+00:00"
+    assert account.last_checked_at == "2026-07-30T12:05:00+00:00"
+    assert account.last_error == ""
+
+
+def test_update_hh_account_clears_stale_error_and_is_user_scoped(
+    tmp_path: Path,
+) -> None:
+    """A successful check can clear last_error; missing users write nothing."""
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_user(telegram_user_id=99, now=NOW)
+    database.create_hh_account(
+        telegram_user_id=42,
+        account_label="alice",
+        now=NOW,
+    )
+    database.create_hh_account(
+        telegram_user_id=99,
+        account_label="bob",
+        now=NOW,
+    )
+    assert database.update_hh_account(
+        42,
+        status="login_required",
+        last_error="HH.kz authorization is required",
+    )
+
+    assert database.update_hh_account(
+        42,
+        status="authorized",
+        last_error="",
+    )
+
+    account_42 = database.get_hh_account_model(42)
+    account_99 = database.get_hh_account_model(99)
+    assert account_42 is not None
+    assert account_99 is not None
+    assert account_42.status == "authorized"
+    assert account_42.last_error == ""
+    assert account_99.status == "disconnected"
+    assert account_99.last_error == ""
+
+    assert database.update_hh_account(
+        123456,
+        status="authorized",
+    ) is False
