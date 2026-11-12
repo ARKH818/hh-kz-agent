@@ -1448,3 +1448,27 @@ def test_hh_account_does_not_break_user_isolation(tmp_path: Path) -> None:
     assert database.update_hh_account(99, account_label="updated_bob")
     assert database.get_hh_account(42)["account_label"] == "alice"
     assert database.get_hh_account(99)["account_label"] == "updated_bob"
+
+def test_get_or_create_hh_account_is_idempotent(tmp_path: Path) -> None:
+    """Repeated calls preserve the existing HH account and its settings."""
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    first = database.get_or_create_hh_account(
+        telegram_user_id=42,
+        now=NOW,
+    )
+    assert database.update_hh_account(
+        42,
+        account_label="Primary account",
+        browser_profile_dir="profiles/user_42",
+        status="authorized",
+    )
+    second = database.get_or_create_hh_account(
+        telegram_user_id=42,
+        now=datetime(2026, 7, 27, 9, 0, tzinfo=UTC),
+    )
+    assert second.id == first.id
+    assert second.telegram_user_id == 42
+    assert second.account_label == "Primary account"
+    assert second.browser_profile_dir == "profiles/user_42"
+    assert second.status == "authorized"

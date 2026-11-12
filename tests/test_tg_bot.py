@@ -444,6 +444,42 @@ def test_repeated_start_does_not_create_duplicate(tmp_path: Path) -> None:
     assert count == 1
 
 
+def test_new_user_start_creates_hh_account(tmp_path: Path) -> None:
+    """A new Telegram user gets an HH account during /start."""
+    telegram, database, _, _ = service(tmp_path)
+
+    user = FakeUser(user_id=99, username="john_doe", first_name="John")
+    message = FakeMessage(text="/start", from_user=user)
+    asyncio.run(telegram._command_handler(message))
+
+    account = database.get_hh_account_model(99)
+    assert account is not None
+    assert account.telegram_user_id == 99
+
+
+def test_repeated_start_preserves_hh_account_settings(
+    tmp_path: Path,
+) -> None:
+    """Repeated /start does not overwrite existing HH account settings."""
+    telegram, database, _, _ = service(tmp_path)
+
+    user = FakeUser(user_id=99, username="john_doe", first_name="John")
+    message = FakeMessage(text="/start", from_user=user)
+    asyncio.run(telegram._command_handler(message))
+
+    account_before = database.get_hh_account_model(99)
+    assert account_before is not None
+
+    assert database.update_hh_account(
+        telegram_user_id=99,
+        account_label="Primary account",
+        browser_profile_dir="profiles/user_99",
+        status="authorized",
+    )
+
+    asyncio.run(telegram._command_handler(message))
+
+
 def test_start_updates_metadata_if_changed(tmp_path: Path) -> None:
     """Repeated /start updates username/first_name if they changed."""
     telegram, database, _, _ = service(tmp_path)

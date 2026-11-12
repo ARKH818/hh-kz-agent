@@ -1046,6 +1046,53 @@ class Database:
                 (telegram_user_id,),
             ).fetchone()
 
+    def get_or_create_hh_account(
+        self,
+        telegram_user_id: int,
+        now: datetime | None = None,
+    ) -> HHAccount:
+        """Return the user's HH account, creating it if absent."""
+        timestamp = _iso(now or datetime.now(UTC))
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO hh_accounts (
+                    telegram_user_id,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (telegram_user_id, timestamp, timestamp),
+            )
+
+            row = connection.execute(
+                """
+                SELECT * FROM hh_accounts
+                WHERE telegram_user_id = ?
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+
+        account = self._hh_account(row)
+        if account is None:
+            raise RuntimeError(
+                "HH account could not be created or loaded "
+                f"for Telegram user {telegram_user_id}"
+            )
+
+        return account
+
+    def get_hh_account_model(
+        self,
+        telegram_user_id: int,
+    ) -> HHAccount | None:
+        """Return the user's HH account as a typed model."""
+        return self._hh_account(
+            self.get_hh_account(telegram_user_id)
+        )
+
     def update_hh_account(
         self,
         telegram_user_id: int,

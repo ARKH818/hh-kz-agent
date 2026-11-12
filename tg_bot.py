@@ -82,11 +82,16 @@ class TelegramService:
         first_name: str | None = None,
     ) -> str:
         if name == "start":
+            now = self.now_factory()
             self.database.get_or_create_user(
                 telegram_user_id=user_id,
                 username=username,
                 first_name=first_name,
-                now=self.now_factory(),
+                now=now,
+            )
+            self.database.get_or_create_hh_account(
+                telegram_user_id=user_id,
+                now=now,
             )
             if self.authorized(user_id):
                 return "Welcome back! HH.kz Agent is ready."

@@ -9,7 +9,7 @@ from config import load_user_settings
 
 if TYPE_CHECKING:
     from config import Settings, UserSettings
-    from database import Database
+    from database import Database, HHAccount
 
 
 @dataclass
@@ -37,6 +37,7 @@ class UserRuntimeContext:
     # materialises a fresh snapshot from ``settings.user_defaults`` —
     # never a shared mutable object.
     user_settings: UserSettings
+    hh_account: HHAccount | None = None
 
     # Per-user runtime control state (replaces the old shared AgentControl)
     paused: bool = False
@@ -48,12 +49,22 @@ class UserRuntimeContext:
     # Diagnostics
     created_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
 
+    def __post_init__(self) -> None:
+        if (
+            self.hh_account is not None
+            and self.hh_account.telegram_user_id != self.telegram_user_id
+        ):
+            raise ValueError(
+                "HH account does not belong to this Telegram user"
+            )
+
 
 def create_runtime_context(
     telegram_user_id: int,
     settings: Settings,
     database: Database,
     user_settings: UserSettings | None = None,
+    hh_account: HHAccount | None = None,
 ) -> UserRuntimeContext:
     """Factory: create a fresh UserRuntimeContext for the given user.
 
@@ -69,9 +80,12 @@ def create_runtime_context(
     """
     if user_settings is None:
         user_settings = load_user_settings(settings)
+    if hh_account is None:
+        hh_account = database.get_hh_account_model(telegram_user_id)
     return UserRuntimeContext(
         telegram_user_id=telegram_user_id,
         settings=settings,
         database=database,
         user_settings=user_settings,
+        hh_account=hh_account,
     )

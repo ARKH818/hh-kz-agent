@@ -328,3 +328,36 @@ def test_replace_isolation_between_users(tmp_path: Path) -> None:
     assert ctx_42.user_settings is not us_42  # new object
     assert ctx_43.user_settings.app_mode == "dry_run"
     assert ctx_43.user_settings is us_43  # untouched
+
+# ============================================================================
+# Phase 5.2 — HH account binding and isolation
+# ============================================================================
+
+def test_context_loads_own_hh_account(tmp_path: Path) -> None:
+    """Each runtime context loads only its own Telegram user's HH account."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+
+    database.create_user(42)
+    database.create_user(43)
+
+    account_42_id = database.create_hh_account(
+        telegram_user_id=42,
+        account_label="Account 42",
+    )
+    account_43_id = database.create_hh_account(
+        telegram_user_id=43,
+        account_label="Account 43",
+    )
+
+    ctx_42 = create_runtime_context(42, settings, database)
+    ctx_43 = create_runtime_context(43, settings, database)
+
+    assert ctx_42.hh_account is not None
+    assert ctx_43.hh_account is not None
+    assert ctx_42.hh_account.id == account_42_id
+    assert ctx_43.hh_account.id == account_43_id
+    assert ctx_42.hh_account.telegram_user_id == 42
+    assert ctx_43.hh_account.telegram_user_id == 43
+    assert ctx_42.hh_account.account_label == "Account 42"
