@@ -81,6 +81,20 @@ class ClaimResult:
     vacancy: Vacancy | None = None
 
 
+@dataclass(frozen=True)
+class HHAccount:
+    id: int
+    telegram_user_id: int
+    account_label: str
+    status: str
+    browser_profile_dir: str
+    last_login_at: str | None
+    last_checked_at: str | None
+    last_error: str
+    created_at: str
+    updated_at: str
+
+
 ALLOWED_TRANSITIONS = {
     VacancyStatus.DISCOVERED: {
         VacancyStatus.REJECTED_BY_FILTER,
@@ -1600,6 +1614,23 @@ class Database:
             approver_id=row["approver_id"],
             error_text=row["error_text"],
             cover_letter=row["cover_letter"],
+        )
+
+    @staticmethod
+    def _hh_account(row: sqlite3.Row | None) -> HHAccount | None:
+        if row is None:
+            return None
+        return HHAccount(
+            id=int(row["id"]),
+            telegram_user_id=int(row["telegram_user_id"]),
+            account_label=row["account_label"],
+            status=row["status"],
+            browser_profile_dir=row["browser_profile_dir"],
+            last_login_at=row["last_login_at"],
+            last_checked_at=row["last_checked_at"],
+            last_error=row["last_error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
     def discover(

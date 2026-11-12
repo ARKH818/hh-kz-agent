@@ -1,9 +1,12 @@
+import dataclasses
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from database import Database, VacancyStatus
+import pytest
+
+from database import Database, HHAccount, VacancyStatus
 
 
 NOW = datetime(2026, 7, 26, 9, 0, tzinfo=UTC)
@@ -1108,6 +1111,7 @@ def test_search_run_backward_compatibility_without_user_id(tmp_path: Path) -> No
     run = database.latest_search_run()
     assert run.error_count == 2
 
+
 # =============================================================================
 # Stage 3.3: get_active_profile tests
 # =============================================================================
@@ -1299,3 +1303,148 @@ def test_get_active_profile_selects_active_resume(tmp_path: Path) -> None:
 
     assert profile is not None
     assert profile.hh.resume_name == "Active Resume"
+
+
+# =============================================================================
+# Phase 5.1: HHAccount domain model tests
+# =============================================================================
+
+
+def _create_hh_account(database: Database) -> None:
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_hh_account(
+        telegram_user_id=42,
+        account_label="main",
+        browser_profile_dir="/tmp/profile",
+        now=NOW,
+    )
+
+
+def test_hh_account_from_db_row(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    _create_hh_account(database)
+
+    row = database.get_hh_account(42)
+    assert row is not None
+
+    account = Database._hh_account(row)
+
+    assert account is not None
+    assert isinstance(account, HHAccount)
+    assert account.telegram_user_id == 42
+    assert account.account_label == "main"
+
+
+def test_hh_account_all_fields_are_correct(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    _create_hh_account(database)
+
+    database.update_hh_account(
+        42,
+        status="connected",
+        last_login_at="2026-07-26T09:30:00+00:00",
+        last_checked_at="2026-07-26T10:00:00+00:00",
+        last_error="",
+    )
+
+    row = database.get_hh_account(42)
+    assert row is not None
+    account = Database._hh_account(row)
+    assert account is not None
+
+    assert account.id == row["id"]
+    assert account.telegram_user_id == 42
+    assert account.account_label == "main"
+    assert account.status == "connected"
+    assert account.browser_profile_dir == "/tmp/profile"
+    assert account.last_login_at == "2026-07-26T09:30:00+00:00"
+    assert account.last_checked_at == "2026-07-26T10:00:00+00:00"
+    assert account.last_error == ""
+    assert account.created_at == row["created_at"]
+    assert account.updated_at == row["updated_at"]
+
+
+def test_hh_account_optional_fields_default_to_none(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    _create_hh_account(database)
+
+    row = database.get_hh_account(42)
+    assert row is not None
+    account = Database._hh_account(row)
+    assert account is not None
+
+    # last_login_at / last_checked_at are NULL until first login/check
+    assert account.last_login_at is None
+    assert account.last_checked_at is None
+
+
+def test_hh_account_from_none_row_returns_none(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    database.init()
+
+    assert Database._hh_account(None) is None
+    assert Database._hh_account(database.get_hh_account(42)) is None
+
+
+def test_hh_account_is_immutable(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    _create_hh_account(database)
+
+    row = database.get_hh_account(42)
+    assert row is not None
+    account = Database._hh_account(row)
+    assert account is not None
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        account.account_label = "changed"  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        account.status = "connected"  # type: ignore[misc]
+
+
+def test_hh_account_does_not_break_upsert(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+
+    account_id_1 = database.create_hh_account(
+        telegram_user_id=42, account_label="main", now=NOW
+    )
+    account_id_2 = database.create_hh_account(
+        telegram_user_id=42, account_label="updated", now=NOW
+    )
+
+    row = database.get_hh_account(42)
+    assert row is not None
+    account = Database._hh_account(row)
+    assert account is not None
+
+    assert account_id_1 == account_id_2
+    assert account.account_label == "updated"
+
+
+def test_hh_account_does_not_break_user_isolation(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.create_user(telegram_user_id=99, now=NOW)
+
+    database.create_hh_account(telegram_user_id=42, account_label="alice", now=NOW)
+    database.create_hh_account(telegram_user_id=99, account_label="bob", now=NOW)
+
+    row_42 = database.get_hh_account(42)
+    row_99 = database.get_hh_account(99)
+    assert row_42 is not None
+    assert row_99 is not None
+
+    account_42 = Database._hh_account(row_42)
+    account_99 = Database._hh_account(row_99)
+    assert account_42 is not None
+    assert account_99 is not None
+
+    assert account_42.telegram_user_id == 42
+    assert account_42.account_label == "alice"
+    assert account_99.telegram_user_id == 99
+    assert account_99.account_label == "bob"
+
+    # User 99 update affects only its own account; user 42 remains unchanged
+    assert database.update_hh_account(99, account_label="updated_bob")
+    assert database.get_hh_account(42)["account_label"] == "alice"
+    assert database.get_hh_account(99)["account_label"] == "updated_bob"
