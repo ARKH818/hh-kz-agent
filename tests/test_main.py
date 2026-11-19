@@ -11,9 +11,10 @@ import pytest
 
 import main as main_module
 from config import load_settings
-from database import Database, VacancyStatus
+from database import Database, HHAccountStatus, VacancyStatus
 from hh_client import (
     CompanyDetails,
+    LoginState,
     PageState,
     VacancyDetails,
     VacancySearchResult,
@@ -23,11 +24,17 @@ from main import (
     SearchRunStats,
     VacancyProcessResult,
     agent_loop,
+    apply_session_state,
     process_vacancy,
     run_search_cycle,
+    session_watchdog,
 )
 from config import load_user_settings
-from runtime_context import HHAccountOwnershipError, create_runtime_context
+from runtime_context import (
+    HHAccountOwnershipError,
+    create_runtime_context,
+    runtime_allows_hh_work,
+)
 from tests.test_config import VALID_ENV, write_profile
 from tg_bot import TelegramService
 
@@ -66,6 +73,9 @@ class FakeHHClient:
 
     async def read_company_details(self, company_url: str):
         return CompanyDetails(4.7, 128)
+
+    async def check_session(self):
+        return LoginState.AUTHORIZED
 
 
 class SearchReached(Exception):
@@ -446,12 +456,17 @@ def _make_two_user_contexts(tmp_path: Path, mode: str = "dry_run"):
     # search_runs.telegram_user_id FOREIGN KEY is satisfied.
     database.create_user(telegram_user_id=42, username="user42", now=NOW)
     database.create_user(telegram_user_id=43, username="user43", now=NOW)
+    # Phase 5.6: a runtime context without a verified HH account is blocked.
+    database.get_or_create_hh_account(telegram_user_id=42, now=NOW)
+    database.get_or_create_hh_account(telegram_user_id=43, now=NOW)
 
     us_a = load_user_settings(app_settings)
     us_b = load_user_settings(app_settings)
 
     ctx_a = create_runtime_context(42, app_settings, database, us_a)
     ctx_b = create_runtime_context(43, app_settings, database, us_b)
+    ctx_a.auth_state = LoginState.AUTHORIZED.value
+    ctx_b.auth_state = LoginState.AUTHORIZED.value
 
     return app_settings, database, ctx_a, ctx_b
 
@@ -767,7 +782,12 @@ def _install_account_run_fakes(
             *,
             user_settings=None,
             hh_account=None,
+            session_lock=None,
+            session_checker=None,
         ):
+            calls["hh_client_session_lock"] = session_lock
+            self.session_lock = session_lock
+            self.session_checker = session_checker
             self.telegram_user_id = telegram_user_id
             self.user_settings = user_settings
             self.hh_account = hh_account
@@ -785,9 +805,20 @@ def _install_account_run_fakes(
                 raise login_error
             return login_result
 
+        async def check_session(self):
+            return LoginState.AUTHORIZED
+
     class FakeTelegramService:
-        def __init__(self, settings_arg, database_arg, approval_service, contexts):
+        def __init__(
+            self,
+            settings_arg,
+            database_arg,
+            approval_service,
+            contexts,
+            **kwargs,
+        ):
             calls["telegram_contexts"] = contexts
+            calls["telegram_hh_client"] = kwargs.get("hh_client")
 
         async def start_polling(self):
             calls["started_polling"] = True
@@ -802,12 +833,19 @@ def _install_account_run_fakes(
         if agent_error is not None:
             raise agent_error
 
+    async def fake_session_watchdog(context, hh_client, telegram):
+        # Production watchdog runs forever; these run() tests only check
+        # startup/wiring/cleanup and must terminate deterministically.
+        calls["session_watchdog_started"] = True
+        return None
+
     monkeypatch.setattr(
         main_module, "create_browser_backend", fake_create_browser_backend
     )
     monkeypatch.setattr(main_module, "HHClient", FakeHHClient)
     monkeypatch.setattr(main_module, "TelegramService", FakeTelegramService)
     monkeypatch.setattr(main_module, "agent_loop", fake_agent_loop)
+    monkeypatch.setattr(main_module, "session_watchdog", fake_session_watchdog)
 
     original_create_runtime_context = main_module.create_runtime_context
 
@@ -1262,3 +1300,151 @@ def test_backend_and_telegram_are_cleaned_up_when_agent_loop_fails(
     assert backends[0].started == 1
     assert backends[0].closed == 1
     assert calls["stopped_telegram"] is True
+
+
+# ============================================================================
+# Phase 5.6 — runtime session gate
+# ============================================================================
+
+
+def test_runtime_gate_requires_confirmed_authorization(tmp_path: Path) -> None:
+    """Only AUTHORIZED permits search/submit work."""
+    _, _, ctx_a, _ = _make_two_user_contexts(tmp_path)
+
+    expected = {
+        LoginState.AUTHORIZED: True,
+        LoginState.NOT_AUTHORIZED: False,
+        LoginState.UNKNOWN: False,
+        LoginState.CHECK_FAILED: False,
+        HHAccountStatus.SESSION_EXPIRED: False,
+        HHAccountStatus.LOGGED_OUT: False,
+    }
+    for state, allowed in expected.items():
+        ctx_a.auth_state = state.value
+        ctx_a.auth_paused = False
+        assert runtime_allows_hh_work(ctx_a) is allowed, state
+
+
+def test_runtime_gate_blocks_context_without_hh_account(tmp_path: Path) -> None:
+    """A legacy/no-account context is unconfirmed and cannot be a bypass."""
+    app_settings = settings(tmp_path, "dry_run")
+    database = Database(app_settings.database_path)
+    database.init()
+    database.create_user(telegram_user_id=99, username="user99", now=NOW)
+    context = create_runtime_context(99, app_settings, database)
+    context.auth_state = LoginState.AUTHORIZED.value
+
+    assert context.hh_account is None
+    assert runtime_allows_hh_work(context) is False
+
+
+def test_apply_session_state_only_authorized_clears_auth_pause(
+    tmp_path: Path,
+) -> None:
+    """Unconfirmed states never clear an existing login pause."""
+    _, _, ctx_a, _ = _make_two_user_contexts(tmp_path)
+    telegram = FakeTelegram()
+    ctx_a.auth_paused = True
+    ctx_a.auth_reason = "session_expired"
+
+    for state in (
+        LoginState.NOT_AUTHORIZED,
+        LoginState.UNKNOWN,
+        LoginState.CHECK_FAILED,
+    ):
+        asyncio.run(apply_session_state(ctx_a, state, telegram))
+        assert ctx_a.auth_state == state.value
+        assert ctx_a.auth_paused is True, state
+        assert runtime_allows_hh_work(ctx_a) is False, state
+        if state in {LoginState.UNKNOWN, LoginState.CHECK_FAILED}:
+            assert ctx_a.auth_reason == "session_check_unconfirmed"
+        else:
+            assert ctx_a.auth_reason == state.value
+
+    for state in (HHAccountStatus.SESSION_EXPIRED, HHAccountStatus.LOGGED_OUT):
+        ctx_a.auth_state = state.value
+        ctx_a.auth_reason = state.value
+        assert runtime_allows_hh_work(ctx_a) is False, state
+
+    asyncio.run(apply_session_state(ctx_a, LoginState.AUTHORIZED, telegram))
+    assert ctx_a.auth_state == LoginState.AUTHORIZED.value
+    assert ctx_a.auth_paused is False
+    assert ctx_a.auth_reason == ""
+
+
+def test_agent_loop_blocks_unconfirmed_session(tmp_path: Path, monkeypatch) -> None:
+    """The agent loop must not search while the session is unconfirmed."""
+    _, _, ctx_a, _ = _make_two_user_contexts(tmp_path)
+    ctx_a.auth_state = LoginState.UNKNOWN.value
+    ctx_a.auth_paused = False
+    ctx_a.wake_event.set()
+    telegram = FakeTelegram()
+    hh_client = FakeHHClient(SUMMARY)
+    search_reached = asyncio.Event()
+
+    async def forbidden_search_cycle(*_args, **_kwargs):
+        search_reached.set()
+        raise SearchReached
+
+    monkeypatch.setattr(main_module, "run_search_cycle", forbidden_search_cycle)
+
+    async def scenario():
+        task = asyncio.create_task(agent_loop(ctx_a, hh_client, telegram))
+        try:
+            await asyncio.wait_for(search_reached.wait(), timeout=0.1)
+        except TimeoutError:
+            pass
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+    assert not search_reached.is_set()
+    assert hh_client.search_calls == 0
+    assert ctx_a.next_run_at is None
+
+
+def test_session_watchdog_contains_check_error(tmp_path: Path, monkeypatch) -> None:
+    """A technical check error must not kill polling or clear the pause."""
+    _, _, ctx_a, _ = _make_two_user_contexts(tmp_path)
+    ctx_a.auth_paused = True
+    ctx_a.auth_reason = "session_expired"
+    telegram = FakeTelegram()
+
+    class BrokenSessionClient(FakeHHClient):
+        async def check_session(self):
+            raise RuntimeError("navigation failed with token=SECRET-DO-NOT-SHOW")
+
+    sleeps = 0
+    check_finished = asyncio.Event()
+
+    async def fake_sleep(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 1:
+            check_finished.set()
+            return
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    async def scenario():
+        task = asyncio.create_task(
+            session_watchdog(ctx_a, BrokenSessionClient(SUMMARY), telegram)
+        )
+        await asyncio.wait_for(check_finished.wait(), timeout=2.0)
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert ctx_a.auth_state == LoginState.CHECK_FAILED.value
+    assert ctx_a.auth_paused is True
+    assert ctx_a.auth_reason == "session_check_unconfirmed"
+    assert telegram.notifications == []

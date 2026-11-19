@@ -10,6 +10,7 @@ from aiogram.types import InputRichBlockDetails, InputRichMessage
 
 from config import load_settings
 from database import Database
+from hh_client import LoginState, LogoutResult
 from config import load_user_settings
 from runtime_context import create_runtime_context
 from tests.test_config import VALID_ENV, write_profile
@@ -86,6 +87,18 @@ def service(
     return telegram, database, context, bot
 
 
+def attach_confirmed_session(
+    telegram: TelegramService, user_id: int = 42
+) -> "FakeSessionClient":
+    """Register a verified client for synchronous resume regression tests."""
+    client = FakeSessionClient(user_id)
+    telegram._hh_clients[user_id] = client
+    context = telegram._contexts[user_id]
+    context.auth_state = LoginState.AUTHORIZED.value
+    context.auth_paused = False
+    return client
+
+
 def add_preview_vacancy(database: Database, telegram_user_id: int = 42) -> None:
     assert database.discover(
         job_id="job-1",
@@ -141,6 +154,7 @@ def test_foreign_user_cannot_pause_or_read_configuration(tmp_path: Path) -> None
 
 def test_pause_resume_and_status_use_live_state(tmp_path: Path) -> None:
     telegram, _, context, _ = service(tmp_path)
+    attach_confirmed_session(telegram, 42)
 
     assert telegram.command("pause", user_id=42) == "Agent paused."
     assert context.paused
@@ -178,6 +192,7 @@ def test_resume_clears_runtime_breaker_but_keeps_saved_diagnostics(
     tmp_path: Path,
 ) -> None:
     telegram, database, context, _ = service(tmp_path)
+    attach_confirmed_session(telegram, 42)
     add_search_run(database)
     context.paused = True
     context.circuit_reason = "page_structure_changed"
@@ -474,10 +489,20 @@ def test_repeated_start_preserves_hh_account_settings(
         telegram_user_id=99,
         account_label="Primary account",
         browser_profile_dir="profiles/user_99",
-        status="authorized",
+    )
+    assert database.confirm_hh_account_authorized(
+        99, last_checked_at=NOW.isoformat()
     )
 
     asyncio.run(telegram._command_handler(message))
+
+    account_after = database.get_hh_account_model(99)
+    assert account_after is not None
+    assert account_after.id == account_before.id
+    assert account_after.account_label == "Primary account"
+    assert account_after.browser_profile_dir == "profiles/user_99"
+    assert account_after.status == "authorized"
+    assert account_after.last_checked_at == NOW.isoformat()
 
 
 def test_start_updates_metadata_if_changed(tmp_path: Path) -> None:
@@ -624,6 +649,8 @@ def test_pause_resume_isolated_between_two_users(tmp_path: Path) -> None:
         bot=FakeBot(),
         now_factory=lambda: NOW,
     )
+    attach_confirmed_session(telegram, 42)
+    attach_confirmed_session(telegram, 43)
 
     # 1. /pause from user 42 → only ctx_a paused
     assert telegram.command("pause", user_id=42) == "Agent paused."
@@ -880,3 +907,359 @@ def test_captcha_send_photo_error_cleans_up_future(tmp_path: Path) -> None:
         other_future.set_result("ok")
 
     asyncio.run(scenario())
+
+
+# ============================================================================
+# Phase 5.6 - ownership-checked /logout and verified /resume
+# ============================================================================
+
+
+class FakeSessionClient:
+    """Deterministic HHClient surface for Telegram command tests."""
+
+    def __init__(
+        self,
+        telegram_user_id: int,
+        *,
+        state: LoginState = LoginState.AUTHORIZED,
+        logout_result: LogoutResult | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.telegram_user_id = telegram_user_id
+        self.state = state
+        self.error = error
+        self.logout_result = logout_result or LogoutResult(
+            True, LoginState.NOT_AUTHORIZED, "confirmed"
+        )
+        self.check_calls = 0
+        self.logout_calls = 0
+        self.session_lock = asyncio.Lock()
+
+    async def check_session(self) -> LoginState:
+        self.check_calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.state
+
+    async def logout(self) -> LogoutResult:
+        self.logout_calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.logout_result
+
+
+def _phase56_service(tmp_path: Path):
+    settings = load_settings(
+        profile_path=write_profile(tmp_path),
+        environ={**VALID_ENV, "APP_MODE": "dry_run"},
+    )
+    settings = replace(settings, database_path=tmp_path / "agent.db")
+    database = Database(settings.database_path)
+    database.init()
+    for user_id in (42, 43):
+        database.create_user(telegram_user_id=user_id, now=NOW)
+        database.get_or_create_hh_account(telegram_user_id=user_id, now=NOW)
+
+    contexts = {}
+    clients = {}
+    for user_id in (42, 43):
+        context = create_runtime_context(
+            user_id, settings, database, load_user_settings(settings)
+        )
+        context.auth_state = LoginState.AUTHORIZED.value
+        context.auth_paused = False
+        contexts[user_id] = context
+        clients[user_id] = FakeSessionClient(user_id)
+
+    telegram = TelegramService(
+        settings,
+        database,
+        FakeApprovalService(),
+        contexts=contexts,
+        bot=FakeBot(),
+        now_factory=lambda: NOW,
+        hh_clients=clients,
+    )
+    return telegram, contexts, clients
+
+
+def test_logout_confirmed_pauses_only_the_callers_runtime(tmp_path: Path) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+
+    reply = asyncio.run(telegram.command_async("logout", 42))
+
+    assert "confirmed" in reply.casefold()
+    assert clients[42].logout_calls == 1
+    assert clients[43].logout_calls == 0
+    assert contexts[42].auth_state == LoginState.NOT_AUTHORIZED.value
+    assert contexts[42].auth_paused is True
+    assert contexts[42].auth_reason == "logged_out"
+    assert contexts[43].auth_state == LoginState.AUTHORIZED.value
+    assert contexts[43].auth_paused is False
+
+
+def test_unconfirmed_logout_does_not_claim_the_session_closed(tmp_path: Path) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    clients[42].logout_result = LogoutResult(
+        False, LoginState.AUTHORIZED, "unconfirmed"
+    )
+    contexts[42].auth_paused = True
+    contexts[42].auth_reason = "existing_pause"
+
+    reply = asyncio.run(telegram.command_async("logout", 42))
+
+    assert "not confirmed" in reply.casefold()
+    assert contexts[42].auth_state == LoginState.AUTHORIZED.value
+    assert contexts[42].auth_paused is True
+    assert contexts[42].auth_reason == "existing_pause"
+
+
+def test_failed_logout_check_fails_runtime_closed(tmp_path: Path) -> None:
+    """An unconfirmed logout must not leave search enabled."""
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    clients[42].logout_result = LogoutResult(
+        False, LoginState.CHECK_FAILED, "invalidate_failed"
+    )
+
+    reply = asyncio.run(telegram.command_async("logout", 42))
+
+    assert "could not be confirmed" in reply.casefold()
+    assert contexts[42].auth_state == LoginState.CHECK_FAILED.value
+    assert contexts[42].auth_paused is True
+    assert contexts[42].auth_reason == "session_check_unconfirmed"
+    assert contexts[43].auth_paused is False
+
+
+def test_ownership_failed_logout_fails_runtime_closed(tmp_path: Path) -> None:
+    """A rejected logout identity must not leave stale runtime access."""
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    clients[42].logout_result = LogoutResult(
+        False, LoginState.CHECK_FAILED, "ownership"
+    )
+
+    reply = asyncio.run(telegram.command_async("logout", 42))
+
+    assert "ownership" in reply.casefold()
+    assert contexts[42].auth_state == LoginState.CHECK_FAILED.value
+    assert contexts[42].auth_paused is True
+    assert contexts[42].auth_reason == "session_check_unconfirmed"
+    assert contexts[43].auth_paused is False
+
+
+def test_resume_only_clears_auth_pause_after_positive_check(tmp_path: Path) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    context = contexts[42]
+    context.paused = True
+    context.auth_paused = True
+    context.auth_reason = "logged_out"
+    context.circuit_reason = "page_structure_changed"
+    context.consecutive_search_errors = 3
+
+    reply = asyncio.run(telegram.command_async("resume", 42))
+
+    assert reply == "Agent resumed."
+    assert clients[42].check_calls == 1
+    assert context.auth_state == LoginState.AUTHORIZED.value
+    assert context.auth_paused is False
+    assert context.auth_reason == ""
+    assert context.paused is False
+    assert context.circuit_reason == ""
+    assert context.consecutive_search_errors == 0
+    assert context.wake_event.is_set()
+
+
+def _auth_snapshot(context):
+    return (
+        context.auth_state,
+        context.auth_paused,
+        context.auth_reason,
+        context.paused,
+        context.circuit_reason,
+        context.consecutive_search_errors,
+        context.next_run_at,
+        context.wake_event.is_set(),
+    )
+
+
+def test_resume_without_hh_client_does_not_clear_pause(tmp_path: Path) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    context = contexts[42]
+    telegram._hh_clients.clear()
+    context.paused = True
+    context.auth_paused = True
+    context.auth_reason = "logged_out"
+    before = _auth_snapshot(context)
+
+    reply = asyncio.run(telegram.command_async("resume", 42))
+
+    assert "not available" in reply.casefold()
+    assert _auth_snapshot(context) == before
+
+
+def test_sync_resume_without_hh_client_does_not_clear_pause(
+    tmp_path: Path,
+) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    context = contexts[42]
+    telegram._hh_clients.clear()
+    context.paused = True
+    context.auth_paused = True
+    context.auth_reason = "logged_out"
+    before = _auth_snapshot(context)
+
+    reply = telegram.command("resume", 42)
+
+    assert "not available" in reply.casefold()
+    assert _auth_snapshot(context) == before
+
+
+@pytest.mark.parametrize("entry_point", ["async", "sync"])
+def test_missing_hh_client_leaves_all_runtime_control_fields_untouched(
+    tmp_path: Path, entry_point: str
+) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    context = contexts[42]
+    telegram._hh_clients.clear()
+    context.auth_state = LoginState.NOT_AUTHORIZED.value
+    context.auth_paused = True
+    context.auth_reason = "logged_out"
+    context.paused = True
+    context.circuit_reason = "page_structure_changed"
+    context.consecutive_search_errors = 3
+    context.next_run_at = NOW + timedelta(minutes=30)
+    before = _auth_snapshot(context)
+
+    if entry_point == "async":
+        reply = asyncio.run(telegram.command_async("resume", 42))
+    else:
+        reply = telegram.command("resume", 42)
+
+    assert "not available" in reply.casefold()
+    assert context.auth_state == before[0]
+    assert context.auth_paused is before[1]
+    assert context.paused is before[3]
+    assert context.wake_event.is_set() is before[7]
+    assert _auth_snapshot(context) == before
+
+
+@pytest.mark.parametrize("entry_point", ["async", "sync"])
+def test_wrong_client_identity_cannot_resume(
+    tmp_path: Path, entry_point: str
+) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    context = contexts[42]
+    registered = FakeSessionClient(43)
+    telegram._hh_clients[42] = registered  # type: ignore[assignment]
+    context.auth_paused = True
+    context.auth_reason = "logged_out"
+    context.paused = True
+    before = _auth_snapshot(context)
+
+    if entry_point == "async":
+        reply = asyncio.run(telegram.command_async("resume", 42))
+    else:
+        reply = telegram.command("resume", 42)
+
+    assert "not available" in reply.casefold()
+    assert registered.check_calls == 0
+    assert _auth_snapshot(context) == before
+    assert contexts[43].auth_paused is False
+
+
+def test_positive_authorized_check_still_allows_resume(tmp_path: Path) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    context = contexts[42]
+    clients[42].state = LoginState.AUTHORIZED
+    context.paused = True
+    context.auth_paused = True
+    context.auth_reason = "logged_out"
+
+    reply = asyncio.run(telegram.command_async("resume", 42))
+
+    assert reply == "Agent resumed."
+    assert clients[42].check_calls == 1
+    assert context.auth_state == LoginState.AUTHORIZED.value
+    assert context.auth_paused is False
+    assert context.auth_reason == ""
+    assert context.paused is False
+    assert context.wake_event.is_set()
+    assert contexts[43].auth_paused is False
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_reason"),
+    [
+        (LoginState.NOT_AUTHORIZED, "not_authorized"),
+        (LoginState.UNKNOWN, "session_check_unconfirmed"),
+        (LoginState.CHECK_FAILED, "session_check_unconfirmed"),
+    ],
+)
+def test_resume_keeps_pause_without_positive_session_check(
+    tmp_path: Path, state: LoginState, expected_reason: str
+) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    context = contexts[42]
+    context.paused = True
+    context.auth_paused = True
+    context.auth_reason = "logged_out"
+    context.circuit_reason = "page_structure_changed"
+    clients[42].state = state
+
+    reply = asyncio.run(telegram.command_async("resume", 42))
+
+    assert "could not be confirmed" in reply.casefold() or (
+        "authorization is required" in reply.casefold()
+    )
+    assert context.auth_state == state.value
+    assert context.auth_paused is True
+    assert context.auth_reason == expected_reason
+    assert context.paused is True
+    assert context.circuit_reason == "page_structure_changed"
+    assert not context.wake_event.is_set()
+    assert contexts[43].auth_paused is False
+
+
+def test_foreign_client_and_context_cannot_be_controlled(tmp_path: Path) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    own_context, other_context = contexts[42], contexts[43]
+    own_client, other_client = clients[42], clients[43]
+    own_context.auth_paused = True
+
+    telegram._contexts[42] = other_context
+    assert asyncio.run(telegram.command_async("logout", 42)) == (
+        "Agent runtime is not running for your account."
+    )
+    assert other_client.logout_calls == 0
+    telegram._contexts[42] = own_context
+
+    telegram._hh_clients[42] = other_client
+    assert asyncio.run(telegram.command_async("logout", 42)) == (
+        "HH session manager is not available."
+    )
+    assert other_client.logout_calls == 0
+    assert own_context.auth_paused is True
+
+    assert asyncio.run(telegram.command_async("resume", 42)) == (
+        "HH session manager is not available."
+    )
+    assert other_client.check_calls == 0
+    assert own_context.auth_paused is True
+
+
+@pytest.mark.parametrize("command", ["logout", "resume"])
+def test_session_check_error_is_contained_by_command_handler(
+    tmp_path: Path, command: str
+) -> None:
+    telegram, contexts, clients = _phase56_service(tmp_path)
+    clients[42].error = RuntimeError("token=SECRET-DO-NOT-SHOW")
+    contexts[42].auth_paused = True
+    contexts[42].auth_reason = "logged_out"
+    message = FakeMessage(f"/{command}", FakeUser(42, "testuser42"))
+
+    asyncio.run(telegram._command_handler(message))
+
+    assert message.answer_text is not None
+    assert "SECRET" not in message.answer_text
+    assert "could not be confirmed" in message.answer_text.casefold()
+    assert contexts[42].auth_paused is True
+    assert contexts[42].auth_reason == "logged_out"

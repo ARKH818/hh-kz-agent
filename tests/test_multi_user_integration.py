@@ -17,8 +17,9 @@ import pytest
 from approval import ApplicationPermission, ApprovalGuard, ApprovalService
 from config import load_settings, load_user_settings
 from database import Database, VacancyStatus
-from hh_client import HHClient
+from hh_client import HHClient, LoginState, LogoutResult
 from runtime_context import HHAccountOwnershipError, create_runtime_context
+from tg_bot import TelegramService
 
 # Re-use existing test helpers from test_hh_client.py
 from tests.test_hh_client import (
@@ -32,6 +33,12 @@ from tests.test_hh_client import (
 )
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+
+
+async def authorized_session() -> LoginState:
+    """Test seam: a positive session re-check before a physical submit."""
+    return LoginState.AUTHORIZED
+
 
 # Minimal environment for Settings — no global profile.yaml, no TG_USER_ID
 _MINIMAL_ENV = {
@@ -96,6 +103,10 @@ def _setup_user_with_profile_and_resume(
         is_active=True,
         now=now,
     )
+    # Phase 5.6: the client only returns AUTHORIZED for an owned HH
+    # account, so every user in these flows owns one (idempotent when a
+    # test already created it explicitly).
+    database.get_or_create_hh_account(telegram_user_id=telegram_user_id, now=now)
 
 
 def _setup_vacancy_and_approve(
@@ -208,6 +219,7 @@ def test_user_42_full_flow_isolated(tmp_path: Path) -> None:
         user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
+        session_checker=authorized_session,
     )
     result = asyncio.run(client.submit_application(permission))
 
@@ -256,6 +268,7 @@ def test_user_43_full_flow_isolated(tmp_path: Path) -> None:
         user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
+        session_checker=authorized_session,
     )
     result = asyncio.run(client.submit_application(permission))
 
@@ -338,6 +351,7 @@ def test_user_42_cannot_use_user_43_resume(tmp_path: Path) -> None:
         user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
+        session_checker=authorized_session,
     )
 
     permission = ApplicationPermission("job-42", permit_42, 42)
@@ -372,6 +386,7 @@ def test_user_43_cannot_use_user_42_resume(tmp_path: Path) -> None:
         user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
+        session_checker=authorized_session,
     )
 
     permission = ApplicationPermission("job-43", permit_43, 43)
@@ -429,6 +444,7 @@ def test_both_users_complete_flows_independently(tmp_path: Path) -> None:
         user_settings=us_42,
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
+        session_checker=authorized_session,
     )
     client_43 = HHClient(
         FakeContext(page_43),
@@ -439,6 +455,7 @@ def test_both_users_complete_flows_independently(tmp_path: Path) -> None:
         user_settings=us_43,
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
+        session_checker=authorized_session,
     )
 
     result_42 = asyncio.run(client_42.submit_application(
@@ -593,6 +610,7 @@ def test_approval_service_user_42_cannot_apply_for_user_43(tmp_path: Path) -> No
         user_settings=load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
+        session_checker=authorized_session,
     )
     service = ApprovalService(
         load_user_settings(settings, app_mode="approval", enable_real_apply=True, max_applications_per_day=10, approval_ttl_minutes=30),
@@ -796,6 +814,14 @@ class _Phase48FakeBot:
         self.messages.append((chat_id, text))
 
 
+class _VerifiedResumeClient:
+    """Identity-verified client for synchronous /resume regression tests."""
+
+    def __init__(self, user_id: int) -> None:
+        self.telegram_user_id = user_id
+        self.session_lock = asyncio.Lock()
+
+
 class _Phase48SuccessHHClient:
     """Completes a search cycle with zero vacancies; counts calls per instance."""
 
@@ -971,6 +997,9 @@ def _phase48_two_contexts(tmp_path: Path, *, check_interval_minutes: int = 1):
     database.init()
     database.create_user(telegram_user_id=42, username="user42", now=NOW)
     database.create_user(telegram_user_id=43, username="user43", now=NOW)
+    # Phase 5.6: work is blocked until a verified HH account is confirmed.
+    database.get_or_create_hh_account(telegram_user_id=42, now=NOW)
+    database.get_or_create_hh_account(telegram_user_id=43, now=NOW)
 
     us_42 = load_user_settings(
         app_settings, check_interval_minutes=check_interval_minutes
@@ -980,6 +1009,8 @@ def _phase48_two_contexts(tmp_path: Path, *, check_interval_minutes: int = 1):
     )
     ctx_42 = create_runtime_context(42, app_settings, database, us_42)
     ctx_43 = create_runtime_context(43, app_settings, database, us_43)
+    ctx_42.auth_state = LoginState.AUTHORIZED.value
+    ctx_43.auth_state = LoginState.AUTHORIZED.value
     return app_settings, database, ctx_42, ctx_43
 
 
@@ -1128,6 +1159,8 @@ def test_independent_paused_and_wake_events(tmp_path: Path) -> None:
         contexts={42: ctx_42, 43: ctx_43},
         bot=object(),
     )
+    bot_service._hh_clients[42] = _VerifiedResumeClient(42)  # type: ignore[assignment]
+    ctx_42.auth_state = "authorized"
 
     cycle_43_before_resume = asyncio.Event()
     cycle_42_after_resume = asyncio.Event()
@@ -1241,6 +1274,8 @@ def test_cross_user_error_and_recovery(tmp_path: Path) -> None:
         contexts={42: ctx_42, 43: ctx_43},
         bot=object(),
     )
+    bot_service._hh_clients[42] = _VerifiedResumeClient(42)  # type: ignore[assignment]
+    ctx_42.auth_state = "authorized"
 
     async def failing_user_42() -> None:
         # Three error cycles: the first parks at the barrier so that user 43
@@ -1545,6 +1580,7 @@ def test_phase54_ownership_isolation_with_separate_browser_profiles(
         hh_account=account_43,
         sleep=lambda _: asyncio.sleep(0),
         now_factory=lambda: now + timedelta(minutes=3),
+        session_checker=authorized_session,
     )
     assert client_43.hh_account is not None
     assert client_43.hh_account.id == account_43.id
@@ -1736,10 +1772,8 @@ def test_phase55_cannot_update_another_users_account_with_forged_identity(
 
     # A write scoped to user 42 does not touch user 43.
     before_43 = dict(database.get_hh_account(43) or {})
-    assert database.update_hh_account(
-        42,
-        status="authorized",
-        last_error="",
+    assert database.confirm_hh_account_authorized(
+        42, last_checked_at=NOW.isoformat(), last_error=""
     )
     after_43 = dict(database.get_hh_account(43) or {})
     assert after_43 == before_43
@@ -1755,8 +1789,10 @@ def test_phase55_cannot_update_another_users_account_with_forged_identity(
         headless=True,
     )
     client.telegram_user_id = 43
-    assert client._persist_account_state(
-        {"status": "authorized", "last_error": ""}
+    assert client._transition_account(
+        "login_required",
+        last_checked_at=NOW.isoformat(),
+        last_error="",
     ) is False
     assert dict(database.get_hh_account(43) or {}) == before_43
 
@@ -1778,3 +1814,204 @@ def test_phase55_cannot_update_another_users_account_with_forged_identity(
     assert stored_42 is not None
     assert stored_42.telegram_user_id == 42
     assert stored_42.browser_profile_dir == profile_42
+
+
+# ============================================================================
+# Phase 5.6 - session expiration, logout and lock isolation (users A and B)
+# ============================================================================
+
+
+class _Phase56LogoutContext(FakeContext):
+    """Browser context that records local session invalidation."""
+
+    def __init__(self, page):
+        super().__init__(page)
+        self.cookies_cleared = False
+        self.storage_cleared = False
+        self.storage_script = ""
+        self.legacy_storage_calls = 0
+        page.evaluate = self._evaluate  # type: ignore[method-assign]
+
+    async def clear_cookies(self) -> None:
+        self.cookies_cleared = True
+
+    async def clear_storage_state(self) -> None:
+        self.legacy_storage_calls += 1
+
+    async def _evaluate(self, script: str) -> None:
+        self.storage_script = script
+        self.storage_cleared = True
+
+
+class _Phase56TelegramClient:
+    def __init__(
+        self,
+        user_id: int,
+        *,
+        state: LoginState = LoginState.AUTHORIZED,
+        logout_ok: bool = True,
+    ) -> None:
+        self.telegram_user_id = user_id
+        self.state = state
+        self.logout_ok = logout_ok
+        self.check_calls = 0
+        self.logout_calls = 0
+        self.session_lock = asyncio.Lock()
+
+    async def check_session(self) -> LoginState:
+        self.check_calls += 1
+        return self.state
+
+    async def logout(self) -> LogoutResult:
+        self.logout_calls += 1
+        if self.logout_ok:
+            return LogoutResult(True, LoginState.NOT_AUTHORIZED, "confirmed")
+        return LogoutResult(False, LoginState.AUTHORIZED, "unconfirmed")
+
+
+def test_phase56_logout_changes_only_the_callers_account_and_profile(
+    tmp_path: Path,
+) -> None:
+    """A confirmed logout for user 42 cannot affect user 43's session."""
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.init()
+    account_42, account_43, profile_42, profile_43 = _phase55_accounts(
+        database, tmp_path
+    )
+    for user_id in (42, 43):
+        assert database.confirm_hh_account_authorized(
+            user_id,
+            last_login_at=NOW.isoformat(),
+            last_checked_at=NOW.isoformat(),
+            last_error="",
+        )
+
+    page_42 = LoginPage(
+        url=LOGIN_PAGE_URL,
+        visible_selectors=(LOGIN_MARKER,),
+    )
+    context_42 = _Phase56LogoutContext(page_42)
+    client_42 = _phase55_client(
+        settings,
+        database,
+        account_42,
+        page_42,
+        user_id=42,
+        headless=True,
+    )
+    client_42.context = context_42
+
+    result = asyncio.run(client_42.logout())
+
+    assert result.ok is True
+    assert context_42.cookies_cleared is True
+    assert context_42.storage_cleared is True
+    assert context_42.legacy_storage_calls == 0
+    stored_42 = database.get_hh_account_model(42)
+    stored_43 = database.get_hh_account_model(43)
+    assert stored_42 is not None
+    assert stored_43 is not None
+    assert stored_42.status == "logged_out"
+    assert stored_42.browser_profile_dir == profile_42
+    assert stored_43.status == "authorized"
+    assert stored_43.browser_profile_dir == profile_43
+    assert stored_43.last_login_at == NOW.isoformat()
+
+
+def test_phase56_telegram_session_commands_are_isolated_between_users(
+    tmp_path: Path,
+) -> None:
+    """/resume and /logout use only the caller's client and context."""
+    settings, database, ctx_42, ctx_43 = _phase48_two_contexts(tmp_path)
+    ctx_42.auth_paused = True
+    ctx_42.auth_reason = "logged_out"
+    ctx_43.auth_paused = True
+    ctx_43.auth_reason = "logged_out"
+
+    clients = {
+        42: _Phase56TelegramClient(42, state=LoginState.AUTHORIZED),
+        43: _Phase56TelegramClient(43, state=LoginState.CHECK_FAILED),
+    }
+    telegram = TelegramService(
+        settings,
+        database,
+        _Phase48NullSender(),
+        contexts={42: ctx_42, 43: ctx_43},
+        bot=object(),
+        hh_clients=clients,
+    )
+
+    assert asyncio.run(telegram.command_async("resume", 42)) == "Agent resumed."
+    assert ctx_42.auth_paused is False
+    assert ctx_42.wake_event.is_set()
+    assert ctx_43.auth_paused is True
+    assert not ctx_43.wake_event.is_set()
+    assert clients[43].check_calls == 0
+
+    assert "confirmed" in asyncio.run(
+        telegram.command_async("logout", 42)
+    ).casefold()
+    assert ctx_42.auth_paused is True
+    assert ctx_42.auth_reason == "logged_out"
+    assert ctx_43.auth_paused is True
+    assert ctx_43.auth_reason == "logged_out"
+    assert clients[42].logout_calls == 1
+    assert clients[43].logout_calls == 0
+
+    reply_43 = asyncio.run(telegram.command_async("resume", 43))
+    assert "could not be confirmed" in reply_43.casefold()
+    assert ctx_43.auth_paused is True
+    assert ctx_43.auth_reason == "session_check_unconfirmed"
+    assert ctx_42.auth_paused is True
+    assert ctx_42.auth_reason == "logged_out"
+
+
+def test_phase56_session_locks_are_per_account(tmp_path: Path) -> None:
+    """Two accounts can be checked concurrently; each account is serialised."""
+    settings, database, ctx_42, ctx_43 = _phase48_two_contexts(tmp_path)
+    assert ctx_42.session_lock is not ctx_43.session_lock
+
+    active = 0
+    peak = 0
+
+    def slow_checker(user_id: int):
+        async def checker() -> LoginState:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return LoginState.AUTHORIZED
+
+        return checker
+
+    clients = []
+    for user_id, context in ((42, ctx_42), (43, ctx_43)):
+        clients.append(
+            HHClient(
+                FakeContext(LoginPage(url=AUTHORIZED_PAGE_URL)),
+                settings,
+                database,
+                ApprovalGuard(context.user_settings, database),
+                telegram_user_id=user_id,
+                user_settings=context.user_settings,
+                hh_account=context.hh_account,
+                session_lock=context.session_lock,
+                session_checker=slow_checker(user_id),
+                sleep=lambda _seconds: asyncio.sleep(0),
+                now_factory=lambda: NOW,
+            )
+        )
+    assert clients[0].session_lock is ctx_42.session_lock
+    assert clients[1].session_lock is ctx_43.session_lock
+
+    async def scenario() -> None:
+        await asyncio.gather(
+            clients[0].check_session(),
+            clients[1].check_session(),
+        )
+
+    asyncio.run(scenario())
+
+    assert peak == 2

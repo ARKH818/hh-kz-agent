@@ -8,7 +8,7 @@ import pytest
 from approval import ApplicationPermission, ApprovalGuard, ApprovalService
 from config import load_settings
 from database import Database, VacancyStatus
-from hh_client import HHClient
+from hh_client import HHClient, LoginState
 from tests.test_config import VALID_ENV, write_profile
 
 
@@ -119,6 +119,11 @@ async def no_sleep(_: float) -> None:
     return None
 
 
+async def authorized_session() -> LoginState:
+    """Test seam: a positive session re-check before a physical submit."""
+    return LoginState.AUTHORIZED
+
+
 def settings(tmp_path: Path, **environment: str):
     loaded = load_settings(
         profile_path=write_profile(tmp_path),
@@ -128,6 +133,10 @@ def settings(tmp_path: Path, **environment: str):
 
 
 def pending(database: Database, job_id: str = "job-1", letter: str = "Letter") -> None:
+    # Phase 5.6: a real HH account is required before the client may
+    # return AUTHORIZED, so every approval test owns one for user 42.
+    database.get_or_create_user(telegram_user_id=42, now=NOW)
+    database.get_or_create_hh_account(telegram_user_id=42, now=NOW)
     assert database.discover(
         job_id=job_id,
         title="Python developer",
@@ -160,6 +169,7 @@ def test_dry_run_blocks_low_level_send_independently_of_backend(
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
     )
 
@@ -186,6 +196,7 @@ def test_direct_low_level_call_without_individual_permission_is_blocked(
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=1)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
     )
 
@@ -211,6 +222,7 @@ def test_approval_service_is_the_valid_path_to_physical_submit(tmp_path: Path) -
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -245,6 +257,7 @@ def test_browser_error_after_claim_becomes_apply_failed(tmp_path: Path) -> None:
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -274,6 +287,7 @@ def test_page_creation_error_after_claim_becomes_apply_failed(tmp_path: Path) ->
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -304,6 +318,7 @@ def test_missing_explicit_success_signal_fails_closed(tmp_path: Path) -> None:
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -333,6 +348,7 @@ def test_employer_questionnaire_blocks_submit(tmp_path: Path) -> None:
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -362,6 +378,7 @@ def test_success_marker_without_hh_confirmation_fails_closed(tmp_path: Path) -> 
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=3),
     )
@@ -393,6 +410,7 @@ def test_permission_is_rechecked_for_expiry_immediately_before_submit(
         database,
         ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=29)),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=no_sleep,
         now_factory=lambda: NOW + timedelta(minutes=60),
     )
@@ -421,6 +439,7 @@ def test_action_delay_never_drops_below_configured_minimum(tmp_path: Path) -> No
         database,
         ApprovalGuard(app_settings, database),
         telegram_user_id=42,
+        session_checker=authorized_session,
         sleep=capture_delay,
     )
 

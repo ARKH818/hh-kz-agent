@@ -17,13 +17,14 @@ from aiogram.exceptions import TelegramAPIError
 from approval import ApprovalGuard, ApprovalService
 from browser_backend import BrowserLaunchError, create_browser_backend
 from config import ConfigError, Settings, load_settings, load_user_settings
-from database import Database, HHAccount, SearchRun, VacancyStatus
-from hh_client import HHClient, PageState, VacancySummary
+from database import Database, HHAccount, HHAccountStatus, SearchRun, VacancyStatus
+from hh_client import HHClient, LoginState, PageState, VacancySummary
 from logging_setup import configure_logging
 from runtime_context import (
     HHAccountOwnershipError,
     UserRuntimeContext,
     create_runtime_context,
+    runtime_allows_hh_work,
     verify_hh_account_ownership,
 )
 from tg_bot import TelegramService
@@ -388,6 +389,75 @@ async def run_search_cycle(
     return result
 
 
+async def apply_session_state(
+    context: UserRuntimeContext,
+    state: LoginState,
+    telegram: TelegramService,
+) -> None:
+    """Apply a session check result to the per-user runtime gate.
+
+    Technical failures never clear an existing auth pause and never claim
+    that the HH session expired.  They only block work until a positive
+    check restores AUTHORIZED.
+    """
+    context.auth_state = state.value
+    if state is LoginState.AUTHORIZED:
+        context.auth_paused = False
+        context.auth_reason = ""
+        return
+
+    if state in {LoginState.UNKNOWN, LoginState.CHECK_FAILED}:
+        # Preserve an existing auth pause; do not invent an expiry reason.
+        if context.auth_paused:
+            context.auth_reason = "session_check_unconfirmed"
+        return
+
+    context.auth_paused = True
+    context.auth_reason = state.value
+    context.next_run_at = None
+    if state is LoginState.NOT_AUTHORIZED:
+        message = "HH.kz authorization is required. Sign in and use /resume."
+    else:
+        message = (
+            "HH.kz session is no longer available. Sign in and use /resume."
+        )
+    try:
+        await telegram.notify(message, telegram_user_id=context.telegram_user_id)
+    except Exception as exc:
+        logger.warning(
+            "session_notification_failed user=%s error=%s",
+            context.telegram_user_id,
+            type(exc).__name__,
+        )
+
+
+async def session_watchdog(
+    context: UserRuntimeContext,
+    hh_client: HHClient,
+    telegram: TelegramService,
+) -> None:
+    """Recheck the HH session periodically without stopping Telegram.
+
+    All exceptions are contained here: an unhandled error would propagate
+    through ``asyncio.gather`` and tear down polling and the browser.
+    """
+    interval_seconds = max(1, context.user_settings.check_interval_minutes) * 60
+    while True:
+        try:
+            state = await hh_client.check_session()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "session_watchdog_error user=%s error=%s",
+                context.telegram_user_id,
+                type(exc).__name__,
+            )
+            state = LoginState.CHECK_FAILED
+        await apply_session_state(context, state, telegram)
+        await asyncio.sleep(interval_seconds)
+
+
 async def agent_loop(
     context: UserRuntimeContext,
     hh_client: HHClient,
@@ -397,7 +467,9 @@ async def agent_loop(
     # Stage 4\6: the polling interval is a per-user setting.
     settings = context.user_settings
     while True:
-        if not context.paused:
+        # Phase 5.6: an unconfirmed HH session blocks the cycle.  The
+        # circuit-breaker pause and the auth pause are independent.
+        if not context.paused and runtime_allows_hh_work(context):
             run = await run_search_cycle(
                 context, hh_client, telegram,
             )
@@ -579,6 +651,7 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
             telegram_user_id=telegram_user_id,
             user_settings=context.user_settings,
             hh_account=context.hh_account,
+            session_lock=context.session_lock,
         )
         # Phase 5.5: the persistent profile is reused as-is.  ensure_login()
         # confirms a positive HH.kz authorisation (or performs a manual login
@@ -595,6 +668,11 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
                 "Run with BROWSER_HEADLESS=false and sign in manually."
             )
 
+        # Phase 5.6: the startup check is the first positive confirmation.
+        context.auth_state = HHAccountStatus.AUTHORIZED.value
+        context.auth_paused = False
+        context.auth_reason = ""
+
         approval_service = ApprovalService(context.user_settings, database, hh_client)
 
         telegram = TelegramService(
@@ -602,6 +680,7 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
             database,
             approval_service,
             contexts={telegram_user_id: context},
+            hh_client=hh_client,
         )
 
         if hasattr(telegram, "check_updates"):
@@ -609,6 +688,9 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
         await asyncio.gather(
             telegram.start_polling(),
             agent_loop(context, hh_client, telegram),
+            # The watchdog catches its own errors; polling and agent work
+            # stay alive even when HH.kz cannot be checked temporarily.
+            session_watchdog(context, hh_client, telegram),
         )
     finally:
         try:

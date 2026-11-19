@@ -95,6 +95,117 @@ class HHAccount:
     updated_at: str
 
 
+class HHAccountStatus(str, Enum):
+    """Persisted HH account session states (Phase 5.6).
+
+    ``connected`` is kept only as a legacy STORED value.  It is normalized
+    on read and accepted as a legacy current state in transition validation,
+    but no public writer can set it.  New code uses the explicit states
+    below.
+    """
+
+    DISCONNECTED = "disconnected"
+    CONNECTED = "connected"
+    AUTHORIZED = "authorized"
+    LOGIN_REQUIRED = "login_required"
+    UNKNOWN = "unknown"
+    CHECK_FAILED = "check_failed"
+    SESSION_EXPIRED = "session_expired"
+    LOGGED_OUT = "logged_out"
+
+
+HH_ACCOUNT_STATUSES = frozenset(status.value for status in HHAccountStatus)
+
+_CHECKABLE = frozenset(
+    {
+        HHAccountStatus.DISCONNECTED.value,
+        HHAccountStatus.AUTHORIZED.value,
+        HHAccountStatus.LOGIN_REQUIRED.value,
+        HHAccountStatus.UNKNOWN.value,
+        HHAccountStatus.CHECK_FAILED.value,
+    }
+)
+_RECOVERABLE = frozenset(
+    {
+        HHAccountStatus.AUTHORIZED.value,
+        HHAccountStatus.LOGIN_REQUIRED.value,
+        HHAccountStatus.UNKNOWN.value,
+        HHAccountStatus.CHECK_FAILED.value,
+        HHAccountStatus.SESSION_EXPIRED.value,
+        HHAccountStatus.LOGGED_OUT.value,
+    }
+)
+
+HH_ACCOUNT_TRANSITIONS: dict[str, frozenset[str]] = {
+    # A never-authorised account can become authorised or inconclusive, but
+    # cannot claim a session "expired" or a logout that never happened.
+    HHAccountStatus.DISCONNECTED.value: _CHECKABLE,
+    # Legacy ``connected`` means "authorised" on read, so it keeps the
+    # authorised transition set.
+    HHAccountStatus.CONNECTED.value: _RECOVERABLE,
+    HHAccountStatus.AUTHORIZED.value: frozenset(
+        {
+            HHAccountStatus.AUTHORIZED.value,
+            HHAccountStatus.UNKNOWN.value,
+            HHAccountStatus.CHECK_FAILED.value,
+            HHAccountStatus.SESSION_EXPIRED.value,
+            HHAccountStatus.LOGGED_OUT.value,
+        }
+    ),
+    HHAccountStatus.LOGIN_REQUIRED.value: _CHECKABLE,
+    # An inconclusive check must not erase the last known authenticated
+    # state.  The persisted status itself is the memory of a prior positive
+    # confirmation; last_login_at is reserved for a real interactive login.
+    HHAccountStatus.UNKNOWN.value: _RECOVERABLE,
+    HHAccountStatus.CHECK_FAILED.value: _RECOVERABLE,
+    HHAccountStatus.SESSION_EXPIRED.value: _RECOVERABLE,
+    HHAccountStatus.LOGGED_OUT.value: _RECOVERABLE,
+}
+
+
+def normalize_hh_account_status(status: str) -> str:
+    """Normalise a legacy status on READ without rewriting stored data.
+
+    Phase 5.6: ``connected`` is the only known legacy alias of an
+    authorised session.  Unrecognised values are returned unchanged so
+    diagnostics can still show what is actually stored.
+    """
+    if status == HHAccountStatus.CONNECTED.value:
+        return HHAccountStatus.AUTHORIZED.value
+    return status
+
+
+def is_hh_account_authorized(status: str | None) -> bool:
+    """True only for a persisted state that represents a confirmed login."""
+    return normalize_hh_account_status(status or "") == (
+        HHAccountStatus.AUTHORIZED.value
+    )
+
+
+def validate_hh_account_transition(current: str, target: object) -> str:
+    """Validate a status change and return the canonical target value.
+
+    Unknown target statuses are rejected explicitly instead of being
+    silently normalised.  A row with an unrecognised *current* status is
+    treated as legacy and may move to any known status.
+    """
+    if not isinstance(target, str) or target not in HH_ACCOUNT_STATUSES:
+        raise ValueError(f"Unknown HH account status: {target!r}")
+    if target == HHAccountStatus.CONNECTED.value:
+        raise ValueError(
+            "connected is a legacy read-only status and cannot be written"
+        )
+    allowed = HH_ACCOUNT_TRANSITIONS.get(current)
+    if allowed is None:
+        # Legacy/unknown stored value: recovery is always possible.
+        return target
+    if target not in allowed:
+        raise ValueError(
+            f"Illegal HH account status transition: {current} -> {target}"
+        )
+    return target
+
+
 ALLOWED_TRANSITIONS = {
     VacancyStatus.DISCOVERED: {
         VacancyStatus.REJECTED_BY_FILTER,
@@ -1148,26 +1259,160 @@ class Database:
         telegram_user_id: int,
         **fields: object,
     ) -> bool:
+        """Update ordinary account fields only.
+
+        Phase 5.6: authorisation state is deliberately NOT an ordinary
+        field.  ``status`` and ``last_login_at`` can only be written through
+        :meth:`transition_hh_account` or
+        :meth:`confirm_hh_account_authorized`, after a real HH session check.
+        Legacy ``connected`` rows are still normalised on read; they can
+        never be written by any public API.
+        """
+        if "status" in fields or "last_login_at" in fields:
+            raise ValueError(
+                "status and last_login_at require the centralised HH "
+                "authorisation API"
+            )
         allowed = {
-            "account_label", "status", "browser_profile_dir",
-            "last_login_at", "last_checked_at", "last_error",
+            "account_label",
+            "browser_profile_dir",
+            "last_checked_at",
+            "last_error",
         }
         if unknown := set(fields) - allowed:
-            raise ValueError(f"Unsupported hh_account fields: {', '.join(sorted(unknown))}")
+            raise ValueError(
+                f"Unsupported hh_account fields: {', '.join(sorted(unknown))}"
+            )
+        if not fields:
+            return False
+        return self._write_hh_account_fields(telegram_user_id, fields)
+
+    @staticmethod
+    def _update_hh_account_fields(
+        connection: sqlite3.Connection,
+        telegram_user_id: int,
+        fields: dict[str, object],
+    ) -> bool:
+        """Write already-validated fields using an open connection."""
         if not fields:
             return False
         assignments = ", ".join(f"{name} = ?" for name in fields)
         values = [*fields.values(), _iso(datetime.now(UTC)), telegram_user_id]
+        cursor = connection.execute(
+            f"""
+            UPDATE hh_accounts
+            SET {assignments}, updated_at = ?
+            WHERE telegram_user_id = ?
+            """,
+            values,
+        )
+        return cursor.rowcount == 1
+
+    def _write_hh_account_fields(
+        self,
+        telegram_user_id: int,
+        fields: dict[str, object],
+    ) -> bool:
+        """Write already-validated hh_accounts fields in one transaction."""
+        if not fields:
+            return False
         with self._connect() as connection:
-            cursor = connection.execute(
-                f"""
-                UPDATE hh_accounts
-                SET {assignments}, updated_at = ?
-                WHERE telegram_user_id = ?
-                """,
-                values,
+            return self._update_hh_account_fields(
+                connection, telegram_user_id, fields
             )
-            return cursor.rowcount == 1
+
+    def _transition_hh_account_status(
+        self,
+        telegram_user_id: int,
+        status: str,
+        *,
+        last_checked_at: str | None,
+        last_error: str | None,
+        last_login_at: str | None = None,
+    ) -> bool:
+        """Validate and apply a centralised HH account status change.
+
+        Validation and the write happen in one transaction, so a concurrent
+        writer cannot slip a different current status in between them.
+        """
+        with self._connect() as connection:
+            # Phase 5.6: reading the current status, validating the
+            # transition and writing the new status must be ONE atomic
+            # unit.  ``with self._connect()`` alone does not open a
+            # transaction before a SELECT, so a concurrent writer could
+            # otherwise change the status between the read and the write
+            # and a transition validated against a stale value would be
+            # applied.  BEGIN IMMEDIATE takes the write lock up front and
+            # serialises the whole transition; any error rolls back.
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT status FROM hh_accounts WHERE telegram_user_id = ?",
+                    (telegram_user_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                validated = validate_hh_account_transition(row["status"], status)
+                fields: dict[str, object] = {"status": validated}
+                if last_checked_at is not None:
+                    fields["last_checked_at"] = last_checked_at
+                if last_error is not None:
+                    fields["last_error"] = last_error
+                if last_login_at is not None:
+                    fields["last_login_at"] = last_login_at
+                return self._update_hh_account_fields(
+                    connection, telegram_user_id, fields
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def transition_hh_account(
+        self,
+        telegram_user_id: int,
+        status: str,
+        *,
+        last_checked_at: str | None = None,
+        last_error: str | None = None,
+    ) -> bool:
+        """Centralised status change for non-AUTHORIZED HH states.
+
+        AUTHORIZED is intentionally excluded: it may only be set by
+        :meth:`confirm_hh_account_authorized` after a positive HH session
+        check.  ``connected`` is rejected by the shared transition validator.
+        """
+        if status == HHAccountStatus.AUTHORIZED.value:
+            raise ValueError(
+                "AUTHORIZED requires confirm_hh_account_authorized()"
+            )
+        return self._transition_hh_account_status(
+            telegram_user_id,
+            status,
+            last_checked_at=last_checked_at,
+            last_error=last_error,
+        )
+
+    def confirm_hh_account_authorized(
+        self,
+        telegram_user_id: int,
+        *,
+        last_checked_at: str,
+        last_error: str = "",
+        last_login_at: str | None = None,
+    ) -> bool:
+        """The sole public path to AUTHORIZED after a positive HH check.
+
+        ``last_login_at`` is optional and must only be supplied for a real
+        successful login.  Automatic re-checks deliberately leave it
+        untouched; their timestamp goes to ``last_checked_at`` instead.
+        """
+        return self._transition_hh_account_status(
+            telegram_user_id,
+            HHAccountStatus.AUTHORIZED.value,
+            last_checked_at=last_checked_at,
+            last_error=last_error,
+            last_login_at=last_login_at,
+        )
 
     def delete_hh_account(self, telegram_user_id: int) -> bool:
         with self._connect() as connection:
@@ -1721,7 +1966,10 @@ class Database:
             id=int(row["id"]),
             telegram_user_id=int(row["telegram_user_id"]),
             account_label=row["account_label"],
-            status=row["status"],
+            # Phase 5.6: legacy values are normalised on READ only.  The
+            # stored row is never rewritten by a read, so this remains
+            # backward compatible without a schema migration.
+            status=normalize_hh_account_status(row["status"]),
             browser_profile_dir=row["browser_profile_dir"],
             last_login_at=row["last_login_at"],
             last_checked_at=row["last_checked_at"],

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from config import load_user_settings
+from database import is_hh_account_authorized
 
 if TYPE_CHECKING:
     from config import Settings, UserSettings
@@ -100,6 +101,19 @@ class UserRuntimeContext:
     next_run_at: datetime | None = None
     wake_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
+    # Phase 5.6: HH session state is separate from the circuit breaker.
+    # ``auth_paused`` can only be cleared by a positive AUTHORIZED check,
+    # therefore a technical failure can never silently resume searching.
+    auth_state: str = "unknown"
+    auth_paused: bool = False
+    auth_reason: str = ""
+
+    # Phase 5.6: one lock per HH session.  It is shared with HHClient so
+    # check_session(), logout() and submit_application() cannot overlap.
+    session_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
+
     # Diagnostics
     created_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
 
@@ -167,3 +181,17 @@ def create_runtime_context(
         user_settings=user_settings,
         hh_account=hh_account,
     )
+
+
+def runtime_allows_hh_work(context: UserRuntimeContext) -> bool:
+    """True only when the runtime may start search/submit work.
+
+    Phase 5.6: UNKNOWN, CHECK_FAILED, NOT_AUTHORIZED, SESSION_EXPIRED and
+    LOGGED_OUT all block work.  A context without a verified HH account is
+    NOT a bypass: it is unconfirmed and therefore blocks work too.
+    """
+    if context.auth_paused:
+        return False
+    if context.hh_account is None:
+        return False
+    return is_hh_account_authorized(context.auth_state)

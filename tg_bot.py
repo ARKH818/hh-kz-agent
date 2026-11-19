@@ -29,7 +29,8 @@ from aiogram.types import (
 
 from approval import ApprovalService
 from config import Settings
-from database import Database, Vacancy
+from database import Database, HHAccountStatus, Vacancy
+from hh_client import HHClient, LoginState
 from runtime_context import UserRuntimeContext
 from updater import ReleaseInfo, check_github_release
 from version import __version__
@@ -51,6 +52,8 @@ class TelegramService:
         bot: Any | None = None,
         dispatcher: Dispatcher | None = None,
         now_factory: Callable[[], datetime] | None = None,
+        hh_client: HHClient | None = None,
+        hh_clients: dict[int, HHClient] | None = None,
     ):
         self.settings = settings
         self.database = database
@@ -64,6 +67,11 @@ class TelegramService:
         self._captcha_futures: dict[int, asyncio.Future[str | None]] = {}
         self.latest_release: ReleaseInfo | None = None
         self._notified_release_tag: str | None = None
+        # Phase 5.6: clients are keyed by their verified Telegram user id,
+        # so a command can never reach another user's HH session.
+        self._hh_clients: dict[int, HHClient] = dict(hh_clients or {})
+        if hh_client is not None:
+            self._hh_clients[hh_client.telegram_user_id] = hh_client
         self._register_handlers()
 
     def authorized(self, user_id: int) -> bool:
@@ -71,7 +79,127 @@ class TelegramService:
         return user is not None and user["is_active"] == 1
 
     def _runtime_context(self, user_id: int) -> UserRuntimeContext | None:
-        return self._contexts.get(user_id)
+        context = self._contexts.get(user_id)
+        if context is None:
+            return None
+        # Phase 5.6: a context stored under a foreign id must never be
+        # controlled by that id.
+        if context.telegram_user_id != user_id:
+            logger.error("runtime_context_identity_rejected user=%s", user_id)
+            return None
+        return context
+
+    def _hh_client_for(self, user_id: int) -> HHClient | None:
+        client = self._hh_clients.get(user_id)
+        if client is None:
+            return None
+        if client.telegram_user_id != user_id:
+            logger.error("hh_client_identity_rejected user=%s", user_id)
+            return None
+        return client
+
+    async def command_async(
+        self,
+        name: str,
+        user_id: int,
+        *,
+        username: str | None = None,
+        first_name: str | None = None,
+    ) -> str:
+        """Async command entry point used by the Telegram handler."""
+        if name in {"logout", "resume"}:
+            try:
+                if name == "logout":
+                    return await self._logout(user_id)
+                return await self._resume(user_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A session check error is contained here: it must never
+                # kill Telegram polling and it is never shown verbatim.
+                logger.warning(
+                    "hh_command_failed command=%s user=%s error=%s",
+                    name,
+                    user_id,
+                    type(exc).__name__,
+                )
+                return (
+                    "HH.kz session state could not be confirmed. "
+                    "Please try again."
+                )
+        return self.command(
+            name, user_id, username=username, first_name=first_name
+        )
+
+    async def _logout(self, user_id: int) -> str:
+        context = self._runtime_context(user_id)
+        if context is None:
+            return NO_RUNTIME_REPLY
+        client = self._hh_client_for(user_id)
+        if client is None:
+            return "HH session manager is not available."
+        result = await client.logout()
+        if result.ok:
+            context.auth_state = LoginState.NOT_AUTHORIZED.value
+            context.auth_paused = True
+            context.auth_reason = HHAccountStatus.LOGGED_OUT.value
+            return "HH.kz logout confirmed. Session closed."
+        if result.reason in {"no_account", "ownership"}:
+            # The session cannot be owned/verified by this caller.  Keep the
+            # runtime closed instead of relying on the caller's stale state.
+            context.auth_state = LoginState.CHECK_FAILED.value
+            context.auth_paused = True
+            context.auth_reason = "session_check_unconfirmed"
+            if result.reason == "no_account":
+                return "HH account is not configured for your Telegram user."
+            return "HH account ownership could not be verified."
+        if result.state is LoginState.AUTHORIZED:
+            return "HH.kz logout was not confirmed: the session is still active."
+        # The session invalidation itself failed, or the post-logout probe
+        # was inconclusive.  Keep the runtime gate closed even though the
+        # logout cannot be claimed as confirmed.
+        context.auth_state = result.state.value
+        context.auth_paused = True
+        context.auth_reason = "session_check_unconfirmed"
+        return "HH.kz session state could not be confirmed after logout."
+
+    async def _resume(self, user_id: int) -> str:
+        context = self._runtime_context(user_id)
+        if context is None:
+            return NO_RUNTIME_REPLY
+        client = self._hh_client_for(user_id)
+        if client is None:
+            # Fail closed.  Without a verified HHClient there is no way to
+            # obtain LoginState.AUTHORIZED, so no runtime or auth state may
+            # be changed.  The former legacy fallback is deliberately gone.
+            return "HH session manager is not available."
+        state = await client.check_session()
+        if state is LoginState.AUTHORIZED:
+            context.auth_state = LoginState.AUTHORIZED.value
+            context.auth_paused = False
+            context.auth_reason = ""
+            context.paused = False
+            context.circuit_reason = ""
+            context.consecutive_search_errors = 0
+            context.next_run_at = None
+            context.wake_event.set()
+            logger.info("agent_resumed user=%s", user_id)
+            return "Agent resumed."
+        context.auth_state = state.value
+        if state in {LoginState.UNKNOWN, LoginState.CHECK_FAILED}:
+            # Do not clear an existing auth pause and do not claim expiry.
+            if context.auth_paused:
+                context.auth_reason = "session_check_unconfirmed"
+            return (
+                "HH.kz session state could not be confirmed. "
+                "Please try /resume again."
+            )
+        context.auth_paused = True
+        context.auth_reason = state.value
+        return (
+            "HH.kz authorization is required. "
+            "Sign in and then use /resume again."
+        )
 
     def command(
         self,
@@ -110,6 +238,19 @@ class TelegramService:
             context = self._runtime_context(user_id)
             if context is None:
                 return NO_RUNTIME_REPLY
+            # A synchronous caller cannot perform a real session check.  It
+            # must therefore fail closed unless an identity-verified client
+            # is registered and an AUTHORIZED result is already cached.
+            # auth_paused is never cleared here: only _resume() may clear it,
+            # and only after client.check_session() returned AUTHORIZED.
+            client = self._hh_client_for(user_id)
+            if client is None:
+                return "HH session manager is not available."
+            if (
+                context.auth_paused
+                or context.auth_state != HHAccountStatus.AUTHORIZED.value
+            ):
+                return "HH.kz session is not confirmed. Use /resume again."
             context.paused = False
             context.circuit_reason = ""
             context.consecutive_search_errors = 0
@@ -117,6 +258,10 @@ class TelegramService:
             context.wake_event.set()
             logger.info("agent_resumed user=%s", user_id)
             return "Agent resumed."
+        if name == "logout":
+            # The Telegram handler always uses command_async(); this reply
+            # only covers direct synchronous callers.
+            return "Use the asynchronous /logout handler."
         if name == "status":
             context = self._runtime_context(user_id)
             if context is None:
@@ -136,6 +281,7 @@ class TelegramService:
                 "версия: " + version_str + "\n"
                 "mode: " + user_mode + "\n"
                 "state: " + ("paused" if context.paused else "running") + "\n"
+                "hh auth: " + context.auth_state + "\n"
                 "processed: " + str(processed) + "\n"
                 "applied today: " + str(self.database.applied_today(self.now_factory(), telegram_user_id=user_id))
             )
@@ -212,6 +358,9 @@ class TelegramService:
             "ошибки: " + str(run.error_count) + " (" + errors + ")\n"
             "последняя ошибка: " + (run.last_safe_error or "нет") + "\n"
             "breaker: " + breaker + "\n"
+            "hh auth: " + context.auth_state + (
+                " (paused)" if context.auth_paused else ""
+            ) + "\n"
             "last breaker: " + (run.circuit_reason or "none") + "\n"
             "следующий запуск: " + next_run
         )
@@ -221,6 +370,7 @@ class TelegramService:
             "status",
             "pause",
             "resume",
+            "logout",
             "pending",
             "stats",
             "diagnostics",
@@ -247,7 +397,7 @@ class TelegramService:
         if not self.authorized(user_id):
             await message.answer(PRIVATE_REPLY)
             return
-        await message.answer(self.command(name, user_id))
+        await message.answer(await self.command_async(name, user_id))
 
     async def _callback_handler(self, callback: CallbackQuery) -> None:
         if not self.authorized(callback.from_user.id):

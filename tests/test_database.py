@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from database import Database, HHAccount, VacancyStatus
+from database import (
+    HHAccount,
+    HHAccountStatus,
+    HH_ACCOUNT_TRANSITIONS,
+    Database,
+    VacancyStatus,
+    is_hh_account_authorized,
+    normalize_hh_account_status,
+    validate_hh_account_transition,
+)
 
 
 NOW = datetime(2026, 7, 26, 9, 0, tzinfo=UTC)
@@ -1341,11 +1350,20 @@ def test_hh_account_all_fields_are_correct(tmp_path: Path) -> None:
 
     database.update_hh_account(
         42,
-        status="connected",
-        last_login_at="2026-07-26T09:30:00+00:00",
         last_checked_at="2026-07-26T10:00:00+00:00",
         last_error="",
     )
+    # Legacy rows are created outside the public API on purpose: the whole
+    # point of Phase 5.6 is that no public writer can create ``connected``.
+    with sqlite3.connect(database.path) as connection:
+        connection.execute(
+            """
+            UPDATE hh_accounts
+            SET status = ?, last_login_at = ?
+            WHERE telegram_user_id = ?
+            """,
+            ("connected", "2026-07-26T09:30:00+00:00", 42),
+        )
 
     row = database.get_hh_account(42)
     assert row is not None
@@ -1355,7 +1373,9 @@ def test_hh_account_all_fields_are_correct(tmp_path: Path) -> None:
     assert account.id == row["id"]
     assert account.telegram_user_id == 42
     assert account.account_label == "main"
-    assert account.status == "connected"
+    # Phase 5.6: legacy values are normalised on read without rewriting
+    # the stored row.
+    assert account.status == "authorized"
     assert account.browser_profile_dir == "/tmp/profile"
     assert account.last_login_at == "2026-07-26T09:30:00+00:00"
     assert account.last_checked_at == "2026-07-26T10:00:00+00:00"
@@ -1461,7 +1481,9 @@ def test_get_or_create_hh_account_is_idempotent(tmp_path: Path) -> None:
         42,
         account_label="Primary account",
         browser_profile_dir="profiles/user_42",
-        status="authorized",
+    )
+    assert database.confirm_hh_account_authorized(
+        42, last_checked_at=NOW.isoformat()
     )
     second = database.get_or_create_hh_account(
         telegram_user_id=42,
@@ -1595,9 +1617,8 @@ def test_update_hh_account_persists_authorization_state(tmp_path: Path) -> None:
         now=NOW,
     )
 
-    assert database.update_hh_account(
+    assert database.confirm_hh_account_authorized(
         42,
-        status="authorized",
         last_login_at="2026-07-30T12:00:00+00:00",
         last_checked_at="2026-07-30T12:05:00+00:00",
         last_error="",
@@ -1628,16 +1649,14 @@ def test_update_hh_account_clears_stale_error_and_is_user_scoped(
         account_label="bob",
         now=NOW,
     )
-    assert database.update_hh_account(
+    assert database.transition_hh_account(
         42,
-        status="login_required",
+        "login_required",
         last_error="HH.kz authorization is required",
     )
 
-    assert database.update_hh_account(
-        42,
-        status="authorized",
-        last_error="",
+    assert database.confirm_hh_account_authorized(
+        42, last_checked_at=NOW.isoformat(), last_error=""
     )
 
     account_42 = database.get_hh_account_model(42)
@@ -1649,7 +1668,341 @@ def test_update_hh_account_clears_stale_error_and_is_user_scoped(
     assert account_99.status == "disconnected"
     assert account_99.last_error == ""
 
-    assert database.update_hh_account(
-        123456,
-        status="authorized",
+    assert database.confirm_hh_account_authorized(
+        123456, last_checked_at=NOW.isoformat()
     ) is False
+
+
+# ============================================================================
+# Phase 5.6 - HH account state machine and legacy read normalisation
+# ============================================================================
+
+
+def _phase56_database(tmp_path: Path) -> Database:
+    database = make_database(tmp_path)
+    database.create_user(telegram_user_id=42, now=NOW)
+    database.get_or_create_hh_account(telegram_user_id=42, now=NOW)
+    return database
+
+
+def test_hh_account_status_helpers() -> None:
+    assert HHAccountStatus.SESSION_EXPIRED.value == "session_expired"
+    assert normalize_hh_account_status("connected") == "authorized"
+    assert normalize_hh_account_status("unknown") == "unknown"
+    assert is_hh_account_authorized("connected") is True
+    assert is_hh_account_authorized("authorized") is True
+    assert is_hh_account_authorized("session_expired") is False
+    assert is_hh_account_authorized("check_failed") is False
+
+
+def test_hh_account_transition_table_rejects_unknown_target() -> None:
+    with pytest.raises(ValueError, match="Unknown HH account status"):
+        validate_hh_account_transition("authorized", "totally-new")
+    with pytest.raises(ValueError, match="Unknown HH account status"):
+        validate_hh_account_transition("authorized", None)
+
+
+def test_hh_account_transition_table_blocks_illegal_jump() -> None:
+    with pytest.raises(ValueError, match="Illegal HH account status transition"):
+        validate_hh_account_transition("disconnected", "session_expired")
+    with pytest.raises(ValueError, match="Illegal HH account status transition"):
+        validate_hh_account_transition("login_required", "logged_out")
+    assert HH_ACCOUNT_TRANSITIONS["authorized"] >= {
+        "session_expired",
+        "logged_out",
+        "check_failed",
+        "unknown",
+    }
+
+
+def test_update_hh_account_rejects_all_authorization_fields(
+    tmp_path: Path,
+) -> None:
+    """Ordinary updates cannot assign legacy, authorized or login time."""
+    database = _phase56_database(tmp_path)
+
+    for fields in (
+        {"status": "connected"},
+        {"status": "authorized"},
+        {"status": "totally-new"},
+        {"last_login_at": NOW.isoformat()},
+    ):
+        with pytest.raises(ValueError, match="centralised HH"):
+            database.update_hh_account(42, **fields)
+
+    account = database.get_hh_account_model(42)
+    assert account is not None
+    assert account.status == "disconnected"
+    assert account.last_login_at is None
+
+
+def test_authorized_requires_the_centralized_confirmation_path(
+    tmp_path: Path,
+) -> None:
+    database = _phase56_database(tmp_path)
+
+    with pytest.raises(ValueError, match="AUTHORIZED requires"):
+        database.transition_hh_account(42, "authorized")
+    with pytest.raises(ValueError, match="legacy read-only"):
+        database.transition_hh_account(42, "connected")
+    with pytest.raises(ValueError, match="Unknown HH account status"):
+        database.transition_hh_account(42, "totally-new")
+    with pytest.raises(ValueError, match="Illegal HH account status transition"):
+        database.transition_hh_account(42, "session_expired")
+
+    assert database.confirm_hh_account_authorized(
+        42, last_checked_at=NOW.isoformat()
+    )
+    account = database.get_hh_account_model(42)
+    assert account is not None
+    assert account.status == "authorized"
+
+
+def test_legacy_connected_is_normalised_on_read_only(tmp_path: Path) -> None:
+    database = _phase56_database(tmp_path)
+    with sqlite3.connect(database.path) as connection:
+        connection.execute(
+            "UPDATE hh_accounts SET status = ? WHERE telegram_user_id = ?",
+            ("connected", 42),
+        )
+
+    account = database.get_hh_account_model(42)
+    assert account is not None
+    assert account.status == "authorized"
+
+    with sqlite3.connect(database.path) as connection:
+        stored = connection.execute(
+            "SELECT status FROM hh_accounts WHERE telegram_user_id = ?",
+            (42,),
+        ).fetchone()
+    assert stored is not None
+    assert stored[0] == "connected"
+
+
+def test_repeated_checks_after_logged_out_and_expired_can_reauthorize(
+    tmp_path: Path,
+) -> None:
+    database = _phase56_database(tmp_path)
+    assert database.confirm_hh_account_authorized(
+        42,
+        last_login_at=NOW.isoformat(),
+        last_checked_at=NOW.isoformat(),
+        last_error="",
+    )
+    assert database.transition_hh_account(42, "session_expired")
+    assert database.transition_hh_account(42, "check_failed")
+    assert database.confirm_hh_account_authorized(
+        42, last_checked_at=NOW.isoformat()
+    )
+
+    assert database.transition_hh_account(42, "logged_out")
+    assert database.transition_hh_account(42, "unknown")
+    assert database.confirm_hh_account_authorized(
+        42, last_checked_at=NOW.isoformat(), last_error=""
+    )
+
+    account = database.get_hh_account_model(42)
+    assert account is not None
+    assert account.status == "authorized"
+
+
+def test_transition_hh_account_updates_persisted_check_metadata(
+    tmp_path: Path,
+) -> None:
+    database = _phase56_database(tmp_path)
+    checked_at = (NOW + timedelta(minutes=5)).isoformat()
+
+    assert database.transition_hh_account(
+        42,
+        "check_failed",
+        last_checked_at=checked_at,
+        last_error="HH.kz session check failed due to a technical error",
+    )
+
+    account = database.get_hh_account_model(42)
+    assert account is not None
+    assert account.status == "check_failed"
+    assert account.last_checked_at == checked_at
+    assert account.last_error == (
+        "HH.kz session check failed due to a technical error"
+    )
+
+
+def test_hh_account_status_isolation_between_accounts(tmp_path: Path) -> None:
+    database = _phase56_database(tmp_path)
+    database.create_user(telegram_user_id=43, now=NOW)
+    database.get_or_create_hh_account(telegram_user_id=43, now=NOW)
+
+    assert database.confirm_hh_account_authorized(
+        42,
+        last_login_at=NOW.isoformat(),
+        last_checked_at=NOW.isoformat(),
+    )
+    assert database.transition_hh_account(42, "logged_out")
+
+    account_42 = database.get_hh_account_model(42)
+    account_43 = database.get_hh_account_model(43)
+    assert account_42 is not None
+    assert account_43 is not None
+    assert account_42.status == "logged_out"
+    assert account_43.status == "disconnected"
+
+
+def test_no_phase56_schema_migration_is_required(tmp_path: Path) -> None:
+    database = _phase56_database(tmp_path)
+    with sqlite3.connect(database.path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(hh_accounts)")
+        }
+
+    assert columns == {
+        "id",
+        "telegram_user_id",
+        "account_label",
+        "status",
+        "browser_profile_dir",
+        "last_login_at",
+        "last_checked_at",
+        "last_error",
+        "created_at",
+        "updated_at",
+    }
+
+
+class _RecordingConnection:
+    """Record executed SQL while delegating to a real connection.
+
+    Used to prove that the transition opens its transaction BEFORE it
+    reads the current status.
+    """
+
+    def __init__(
+        self, connection: sqlite3.Connection, statements: list[str]
+    ) -> None:
+        self._connection = connection
+        self._statements = statements
+
+    def execute(self, sql: str, parameters=()):
+        self._statements.append(sql.strip().upper())
+        return self._connection.execute(sql, parameters)
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+    def __enter__(self) -> "_RecordingConnection":
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._connection.__exit__(*exc_info)
+
+
+def test_hh_account_transition_locks_before_reading_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BEGIN IMMEDIATE must precede the SELECT, validate and UPDATE."""
+    database = _phase56_database(tmp_path)
+    statements: list[str] = []
+    original_connect = Database._connect
+
+    def recording_connect(self: Database) -> _RecordingConnection:
+        return _RecordingConnection(original_connect(self), statements)
+
+    monkeypatch.setattr(Database, "_connect", recording_connect)
+
+    assert database.transition_hh_account(
+        42, "check_failed", last_checked_at=NOW.isoformat()
+    )
+
+    begin_index = statements.index("BEGIN IMMEDIATE")
+    select_index = next(
+        index
+        for index, sql in enumerate(statements)
+        if sql.startswith("SELECT STATUS FROM HH_ACCOUNTS")
+    )
+    update_index = next(
+        index
+        for index, sql in enumerate(statements)
+        if sql.startswith("UPDATE HH_ACCOUNTS")
+    )
+    assert begin_index < select_index < update_index
+    # No write may happen before the transaction is opened.
+    assert not any(
+        sql.startswith(("UPDATE", "INSERT", "DELETE"))
+        for sql in statements[:begin_index]
+    )
+
+
+def test_hh_account_transition_ignores_stale_concurrent_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writer cannot change the status between the read and the write."""
+    database = _phase56_database(tmp_path)
+    account = database.get_hh_account_model(42)
+    assert account is not None
+    assert account.status == "disconnected"
+
+    competing_outcome: list[str] = []
+    real_validate = validate_hh_account_transition
+
+    def racing_validate(current: str, target: object) -> str:
+        # Runs INSIDE the transition, after BEGIN IMMEDIATE and the SELECT.
+        try:
+            with sqlite3.connect(database.path, timeout=0.2) as other:
+                other.execute(
+                    "UPDATE hh_accounts SET status = ? "
+                    "WHERE telegram_user_id = ?",
+                    ("logged_out", 42),
+                )
+            competing_outcome.append("applied")
+        except sqlite3.OperationalError:
+            competing_outcome.append("blocked")
+        return real_validate(current, target)
+
+    monkeypatch.setattr(
+        "database.validate_hh_account_transition", racing_validate
+    )
+
+    assert database.transition_hh_account(
+        42, "check_failed", last_checked_at=NOW.isoformat()
+    )
+
+    assert competing_outcome == ["blocked"]
+    stored = database.get_hh_account_model(42)
+    assert stored is not None
+    # The transition was validated against the state that was still
+    # current while the write lock was held.
+    assert stored.status == "check_failed"
+
+
+def test_hh_account_transition_rolls_back_and_releases_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validation error rolls back and leaves no lock or partial write."""
+    database = _phase56_database(tmp_path)
+    assert database.confirm_hh_account_authorized(
+        42, last_checked_at=NOW.isoformat(), last_error=""
+    )
+
+    def exploding_validate(current: str, target: object) -> str:
+        raise RuntimeError("validation exploded")
+
+    monkeypatch.setattr(
+        "database.validate_hh_account_transition", exploding_validate
+    )
+
+    with pytest.raises(RuntimeError, match="validation exploded"):
+        database.transition_hh_account(42, "logged_out")
+
+    # The rollback released the write lock: another connection can write
+    # immediately, and the failed transition changed nothing.
+    with sqlite3.connect(database.path, timeout=0.2) as connection:
+        connection.execute(
+            "UPDATE hh_accounts SET last_error = ? WHERE telegram_user_id = ?",
+            ("after-rollback", 42),
+        )
+    stored = database.get_hh_account_model(42)
+    assert stored is not None
+    assert stored.status == "authorized"
+    assert stored.last_error == "after-rollback"
