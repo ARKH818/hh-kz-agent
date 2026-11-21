@@ -1,3 +1,642 @@
+
+
+
+
+hh-kz-agent project structure (audited working tree)
+Root reviewed: C:\Users\khudo\Downloads\hh-kz-agent-main\hh-kz-agent-main
+
+Production source (included in bundle):
+  approval.py
+  browser_backend.py
+  config.py
+  database.py
+  fit_summary.py
+  hh_client.py
+  logging_setup.py
+  main.py
+  runtime_context.py
+  security_utils.py
+  setup_wizard.py
+  tg_bot.py
+  updater.py
+  vacancy_filter.py
+  version.py
+
+Tests (included in bundle):
+  tests/test_approval.py
+  tests/test_browser_backend.py
+  tests/test_config.py
+  tests/test_database.py
+  tests/test_hh_client.py
+  tests/test_main.py
+  tests/test_multi_user_integration.py
+  tests/test_runtime_context.py
+  tests/test_security_phase57.py
+  tests/test_setup_wizard.py
+  tests/test_tg_bot.py
+  tests/test_updater.py
+
+Configuration/documentation (included in bundle):
+  .env.example
+  .gitignore
+  README.md
+  SECURITY.md
+  SETUP_CHECKLIST.md
+  profile.example.yaml
+  pytest.ini
+  requirements.txt
+  requirements-dev.txt
+  BASELINE_AND_PHASE57.md
+  PROJECT_STRUCTURE.txt
+  VERSIONS_AND_DEPENDENCIES.md
+  MANIFEST.txt
+
+External patch (included in bundle):
+  phase57.patch
+
+Present in working tree but deliberately excluded from bundle:
+  .git/                         repository metadata
+  .venv/                        local virtual environment
+  __pycache__/                  Python bytecode cache
+  tests/__pycache__/            Python bytecode cache
+  .pytest_cache/                pytest cache
+  e migration and setup wizard  captured ANSI-colored diff artifact, not production source
+  .env                          not present; excluded by policy if found
+  *.db, *.sqlite, *.sqlite3     runtime/user databases; excluded by policy
+  state.json, storage_state.json, cookies*, profiles/results/*, .browser-profile*/  session data; excluded by policy
+  *.log                         logs; excluded by policy
+
+No tests were executed during the audit; no cache or working-tree state was changed by the audit.
+
+# Versions and dependencies (read-only observation)
+
+## Application
+
+- `version.py`: `__version__ = "1.2.6"`
+- `SECURITY.md`: minimum supported Python version documented as **3.11**; `SETUP_CHECKLIST.md` recommends 3.13.
+- `setup_wizard.py` explicitly checks for Python 3.11+ (as described in `SECURITY.md:5-9`).
+
+## Toolchain observed during this audit
+
+- Python used for version check: `3.14.10` from the project's local `.venv` (only `--version` was run; no application code executed inside it).
+- Git: `2.56.1.windows.1`
+- pytest: `9.1.1` (`pytest --version` only; the test suite was **not** run).
+
+## Runtime dependencies (`requirements.txt`)
+
+```
+aiogram==3.30.0
+aiohttp==3.14.3
+cloakbrowser==0.5.2
+cryptography==49.0.0
+httpx==0.28.1
+mistralai==2.7.0
+playwright==1.61.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+PyYAML==6.0.3
+```
+
+## Development dependencies (`requirements-dev.txt`)
+
+```
+pytest==9.1.1
+pytest-asyncio==1.4.0
+```
+
+## pytest configuration
+
+`pytest.ini`:
+
+```
+[pytest]
+pythonpath = .
+```
+
+No dependency files were modified. The local `.venv` and all caches are excluded from the audit bundle.
+
+
+
+
+
+# Baseline and Phase 5.7 reference
+
+## Baseline
+
+- Repository: `https://github.com/ARKH818/hh-kz-agent.git`
+- Baseline commit: `284cbb5e26eeb48b55d271bd28e9f1d17e55bd55`
+- Baseline subject: `Complete Phase 5.6 logout and session expiration`
+- Remote refs observed locally:
+  - `refs/remotes/origin/main` -> `284cbb5e26eeb48b55d271bd28e9f1d17e55bd55`
+  - `refs/remotes/origin/HEAD` -> `284cbb5e26eeb48b55d271bd28e9f1d17e55bd55`
+- Local branch state: `refs/heads/master` exists but has no commit; all working-tree files are untracked. This is an extract of the patched state, not a checked-out branch.
+
+## Phase 5.7 patch
+
+- File: `phase57.patch` (included in this bundle)
+- Expected SHA256: `0CF7A93D81BCD71A9D0138FD19D4C63252C1C25F8A3E7ECA7B3ADCE587F96BBE`
+- Measured SHA256: `0CF7A93D81BCD71A9D0138FD19D4C63252C1C25F8A3E7ECA7B3ADCE587F96BBE`
+- Verification: `git apply --check --reverse phase57.patch` succeeded against the audited working tree, i.e. the exact patch content is present.
+
+## Files touched by Phase 5.7
+
+Modified:
+- `.gitignore`
+- `browser_backend.py`
+- `config.py`
+- `database.py`
+- `hh_client.py`
+- `logging_setup.py`
+- `main.py`
+- `setup_wizard.py`
+- `tests/test_approval.py`
+- `tests/test_browser_backend.py`
+- `tests/test_hh_client.py`
+- `tests/test_multi_user_integration.py`
+- `tg_bot.py`
+- `updater.py`
+
+Added:
+- `SECURITY.md`
+- `security_utils.py`
+- `tests/test_security_phase57.py`
+
+## What Phase 5.7 changed (summary)
+
+- Filesystem safety layer in `security_utils.py`: lexical/path-component validation, symlink and Windows reparse-point rejection, handle-relative directory creation and file opening, ACL/permission hardening for protected files and directories.
+- Browser profile protection: profile root and per-account profiles are validated/protected before launching a browser; launch errors are sanitised.
+- SQLite protection: validated path resolution, guard handle during `sqlite3.connect()`, protection of database and side files.
+- Logging/config redaction: `safe_exception_message()`, `RedactingFilter`, secret-aware config errors and setup-wizard input.
+- Session isolation: ownership verified before session check/logout, per-account `asyncio.Lock`, HH-origin-only cleanup, logged-out/expired states separated from circuit-breaker pauses.
+- Telegram callback identity checks for approvals and submit permissions.
+
+This document is descriptive only; no code was changed during the audit.
+
+Phase 5.8 read-only audit bundle manifest
+Generated from explicit allowlist. No secrets, runtime databases, session data, profiles, virtualenvs or caches included.
+
+Baseline: 284cbb5e26eeb48b55d271bd28e9f1d17e55bd55 (origin/main)
+Patch: phase57.patch SHA256 0CF7A93D81BCD71A9D0138FD19D4C63252C1C25F8A3E7ECA7B3ADCE587F96BBE
+Patch verification: git apply --check --reverse phase57.patch => OK
+
+Bundled files: 40 plus MANIFEST.txt (self; checksum omitted).
+
+ENTRY                                                     BYTES SHA256
+.env.example                                                459 C28662CD55417E7D6A5005C9267B074B38843859C23EB3B2A5427925B7791B67
+.gitignore                                                  477 F4AD959E4C73F8004D9A4B6796600B4CDEB0D3EA83061AE0C117FDD741CBFC89
+README.md                                                     1 01BA4719C80B6FE911B091A7C05124B64EEECE964E09C058EF8F9805DACA546B
+SECURITY.md                                               11226 A47926C21B73B83A20999DA503E27BB9F25DA654E99A75FC26909F5A56B3FEA4
+SETUP_CHECKLIST.md                                        12935 649E309374B419EFE2F11B9F67279DC26B9DE3CC9930BCD161489832FC11C2C5
+profile.example.yaml                                       2119 FB46753642ABC3743B1F8EFE500DD542D5150A9CC911E7C0A539653D82E4EE14
+pytest.ini                                                   23 88C344EA0F814AB7B9108BB818651DB34EF2B8C81DC5B5BF6BCD64823038A54A
+requirements.txt                                            175 D5DBC7B8988FE3A2B16D022ED06AA87CB129FAA446AD065981C4680835BB49FB
+requirements-dev.txt                                         36 6ACABB5BC0E99049DA0506E17213DCE5F3C3F7D6B8B6FDE3DF7EE782EDB49777
+approval.py                                                4901 0518FB4BEC2CF6707F49D60FE184FA86E8C2BABBF96F50EB1C3E18B396A2E3D7
+browser_backend.py                                         5834 C6845A77EF47FB7EEC69962460E5949890D070F35652E5BA2C78F04E4614887D
+config.py                                                 16359 5D95865037ADAC6CCF0DC00A1EF736D2EC678BBC92054F284E48560D13BBE051
+database.py                                              104595 747B20B5D92F9485C5297D075CA523FC7F00B367EE8B330F90028C67CBBE079B
+fit_summary.py                                             1405 1E0CFA3A5B7332C5FB46F9C85A720CC89C26F1AAE2350B306CD10D9CBF9BD2CE
+hh_client.py                                              56577 8FE65F77ED19AF4E8497B18D7723AC4DC46BE55463FC6B8344C177FCE595B1E2
+logging_setup.py                                          11307 C068F13C60CA3A6988F3A66A8004106D266C11B90677E2700681A85E5124BEA8
+main.py                                                   29606 7D41AE8205CAF6262F81160C5A17DFA93BAACA27ECDA247BF20EA94B3E48212A
+runtime_context.py                                         7291 EF95776BDD1DEA0D1DC8208A8DD7B3484D94A5C8C86748DF7CA8E005FED369F0
+security_utils.py                                         43289 6405A94ACE391116CCEC9B7EE16A007A46EBD499AB52D32DCEA5336EE4ECC640
+setup_wizard.py                                           38335 2BD01301369EFD51282594CFDE74384DCBBCA5307DB6F9C6953DD748590210EC
+tg_bot.py                                                 29094 ABD0A28B0845EC0421F73ED34F86954D076D11FEDA9402B7E257B3A9E7020361
+updater.py                                                 2520 14EC3A402FD2500ECF52EA64B0DBD3CC49E11893603F68BAAC10300A31287FE7
+vacancy_filter.py                                          3112 5B5F0CCE742543137F1B3FD0F5AF10E59D472E75C62D6E313BBF52F87CB42A88
+version.py                                                  864 1AA7B2D183DEF1BB63D5A748784EB67352F979841DA5781FE5EC15C36EA9F3CE
+tests/test_approval.py                                    15064 1331ED82BDA0217F2FA3DD17347CD71AA84F3E6458048CE4678CFB22EDA35269
+tests/test_browser_backend.py                              6899 7E4B7FDBD7DE77962E8CCEE0BB3AB1AE305F9F5A643076BD024BD592D6546708
+tests/test_config.py                                      10137 89A62C63249824983D7A6D6EA27AA01AC1CF9A3931CAA83715B2F86876111957
+tests/test_database.py                                    69422 2C5CC808C5F90CA67555D0D8A1A312CA6F08D6BAE5D9F59DDF935A15D123163A
+tests/test_hh_client.py                                   66952 977988A826B3FCC58CB627F0E56B11D668E3C60353719A192F57A386B6A85F89
+tests/test_main.py                                        49203 62D46F3D1608509A36E6D5E6592FA89A7D3903B2F4F4505B3C1A789CD4B36B21
+tests/test_multi_user_integration.py                      74101 45340178FD73218FA04F6E56C62D964D4DE974E21FE901A66E0E973E34B87B21
+tests/test_runtime_context.py                             18999 F5C0F4824D770525F51A3EFEB1DC2A392460A1D03F6016AA526B52A9F5DC4C30
+tests/test_security_phase57.py                            83073 5B89B57B97398F5C79B208A89E4A28CF160DD1D522CE3BD22C8CE0B25CAE042B
+tests/test_setup_wizard.py                                 2660 0ED90E007E97C19400B59FFADD27E594F696D909AF99729AD040C1D73A6FEC83
+tests/test_tg_bot.py                                      46179 2D782CB37E6F0D6A7EA1FBF039681556222119B2CEF277E374ED6766B2DE0B62
+tests/test_updater.py                                      3947 5BA0942DF9C4A949ABE54C2A73BC13079F4520504A353B07164C7237F677C620
+BASELINE_AND_PHASE57.md                                    2428 4A6F18E77200354977ABB00C2AA4057FF4FC6B80BD3AEA6F11318486EB8061BF
+PROJECT_STRUCTURE.txt                                      1961 03A5B500BD4E3990273F2CE2E3AFAD421EE61C9E56DB21607AFCAAB4670E2DDC
+VERSIONS_AND_DEPENDENCIES.md                               1109 A890C8D1D3F0854C3DE053BD6E9562588D88100892AE74440492A90BD408E343
+phase57.patch                                            195383 0CF7A93D81BCD71A9D0138FD19D4C63252C1C25F8A3E7ECA7B3ADCE587F96BBE
+
+Excluded by policy: .env, credentials/cookies/session data, user databases, profiles, .venv, __pycache__, .pytest_cache, .git, logs.
+Excluded artifact: "e migration and setup wizard" (captured ANSI diff, not production source).
+PHASE58_AUDIT.md is intentionally not bundled because it contains this ZIP SHA256.
+
+# Phase 5.8 — read-only architecture/security audit
+
+Дата аудита: 2026-11-21  
+Корень проверенного дерева: `C:\Users\khudo\Downloads\hh-kz-agent-main\hh-kz-agent-main`  
+Baseline: `284cbb5e26eeb48b55d271bd28e9f1d17e55bd55` (`origin/main`, `Complete Phase 5.6 logout and session expiration`)  
+Phase 5.7 patch: `C:\Users\khudo\Documents\Проект по умолчанию\phase57.patch`  
+SHA256 patch: `0CF7A93D81BCD71A9D0138FD19D4C63252C1C25F8A3E7ECA7B3ADCE587F96BBE`  
+Проверка patch: `git apply --check --reverse phase57.patch` → `OK`  
+SHA256 `phase58_audit_bundle.zip`: `620D3FA84B6B3817BEF6563729CD8FE58C72C9677779F061B1C8E85D0001EEA7`
+
+## 0. Режим, границы и_METHOD
+
+Аудит выполнен **строго read-only**:
+
+- production-код, тесты, конфигурация и рабочее дерево не изменялись;
+- тесты **не запускались** (выполнялись только `python --version`, `git --version`, `pytest --version`, чтение файлов, `git log`, `git apply --check --reverse`);
+- не выполнялись `commit`, `push`, `reset`, `checkout`, `clean`;
+- не добавлялись AI/LLM-функции;
+- наличие теста не считалось доказательством защиты — проверялась реальная цепочка вызовов и сигнатуры;
+- защиты, которые не удалось подтвердить кодом, ниже не предполагаются.
+
+### Модель угроз,_used в отчёте
+
+1. **Неавторизованный Telegram-пользователь** — может отправлять команды/callback'и боту. Действительный `from_user.id` является единственным аутентичным идентификатором на этом уровне.
+2. **Процесс/код внутри приложения** — может напрямую вызывать `Database`, `HHClient`, `create_runtime_context`, `create_browser_backend`. Такой вызывающий **не считается аутентифицированным** только потому, что передал `telegram_user_id`.
+3. **Локальный процесс с тем же OS-пользователем** — не является доверенной границей; ACL POSIX/Windows не изолируют его от файлов приложения. Это прямо указано в `SECURITY.md:27-29`.
+4. **Файловая подмена в каталоге профилей/БД** — рассматривается как частично сниженный риск, но не как полная TOCTOU-гарантия; `SECURITY.md:3` явно не заявляет полную TOCTOU-proofness.
+
+Поэтому в отчёте нет CRITICAL-находок с удалённым неавторизованным обходом: такой путь не подтверждён. High-находки относятся к in-process/файловой модели угроз и к нарушению функциональной изоляции между аккаунтами.
+
+---
+
+## 1. Exact file list reviewed
+
+### Production source
+
+- `approval.py`
+- `browser_backend.py`
+- `config.py`
+- `database.py`
+- `fit_summary.py`
+- `hh_client.py`
+- `logging_setup.py`
+- `main.py`
+- `runtime_context.py`
+- `security_utils.py`
+- `setup_wizard.py`
+- `tg_bot.py`
+- `updater.py`
+- `vacancy_filter.py`
+- `version.py`
+
+### Tests
+
+- `tests/test_approval.py`
+- `tests/test_browser_backend.py`
+- `tests/test_config.py`
+- `tests/test_database.py`
+- `tests/test_hh_client.py`
+- `tests/test_main.py`
+- `tests/test_multi_user_integration.py`
+- `tests/test_runtime_context.py`
+- `tests/test_security_phase57.py`
+- `tests/test_setup_wizard.py`
+- `tests/test_tg_bot.py`
+- `tests/test_updater.py`
+
+### Config/docs/metadata
+
+- `.env.example`
+- `.gitignore`
+- `README.md`
+- `SECURITY.md`
+- `SETUP_CHECKLIST.md`
+- `profile.example.yaml`
+- `pytest.ini`
+- `requirements.txt`
+- `requirements-dev.txt`
+- `version.py`
+- `e migration and setup wizard` — прочитан как captured ANSI-diff, не как production source; в bundle не включён.
+
+### External/reference
+
+- `C:\Users\khudo\Documents\Проект по умолчанию\phase57.patch` — прочитан, хэш проверен, reverse-apply check успешен.
+
+---
+
+## 2. Baseline and Phase 5.7 verification
+
+Локальный `HEAD` находится в unborn state (`master` без коммитов); все файлы проекта не отслеживаются Git. `origin/main` и `origin/HEAD` указывают на baseline `284cbb5e26eeb48b55d271bd28e9f1d17e55bd55`.
+
+Phase 5.7 patch проверен read-only:
+
+- измеренный SHA256 совпадает с ожидаемым;
+- `git apply --check --reverse phase57.patch` вернул `OK`, то есть содержимое patch'а точно присутствует в проверенном дереве.
+
+Patch изменяет:
+
+- `.gitignore`, `browser_backend.py`, `config.py`, `database.py`, `hh_client.py`, `logging_setup.py`, `main.py`, `setup_wizard.py`, `tg_bot.py`, `updater.py`;
+- тесты: `tests/test_approval.py`, `tests/test_browser_backend.py`, `tests/test_hh_client.py`, `tests/test_multi_user_integration.py`;
+- добавляет: `SECURITY.md`, `security_utils.py`, `tests/test_security_phase57.py`.
+
+Подробности вынесены в `BASELINE_AND_PHASE57.md` (включён в bundle).
+
+---
+
+## 3. Сводка по зонам A–G
+
+| Зона | Вердикт | Ключевые находки |
+|---|---|---|
+| A — владение HH-аккаунтом | Реализованы immutable context и dual-id lookup, но модель caller-identity отсутствует | P58-01, P58-02, P58-08, P58-09 |
+| B — сессия/HHClient | Fail-closed проверки есть; нет привязки клиента к живому browser context; есть гонки и signature-баг | P58-03, P58-05, P58-07, P58-13, P58-17 |
+| C — данные/вакансии/сообщения | Найдены глобальные ключи и ownerless reads/writes | P58-04, P58-06, P58-10, P58-14 |
+| D — браузер/профиль | В единственном production-пути запуск послеownership-check; сама фабрика/бэкенд такой гарантии не даёт | P58-02, P58-15, P58-16 |
+| E — Telegram handlers/runtime | ID берётся из `from_user.id`; но callbacks, registry и auth transitionsHave gaps | P58-05, P58-07, P58-11, P58-12, P58-18, P58-19 |
+| F — database isolation | Схема пользователей есть; у DB нет authenticated principal; у части таблиц нет FK/owner | P58-01, P58-02, P58-10, P58-14 |
+| G — тесты | 11/15 обязательных сценариев имеют coverage; 4 отсутствуют, часть тестов false-positive-prone | P58-21 |
+
+### Подтверждённые положительные механизмы
+
+Не следует предполагать больше перечисленного, но следующее реально реализовано:
+
+- `HHAccount` — frozen dataclass (`database.py:95-107`).
+- `UserRuntimeContext.__setattr__` блокирует переопределение `telegram_user_id` и `hh_account` (`runtime_context.py:139-146`).
+- `verify_hh_account_ownership()` проверяет объект, строку БД, владельца и путь профиля (`runtime_context.py:20-62`).
+- `Database.get_hh_account_by_id()` требует пару `(id, telegram_user_id)` (`database.py:1322-1349`).
+- Все HH-аккаунты ключуются по `telegram_user_id`; `UNIQUE(telegram_user_id)` (`database.py:551`).
+- Атомарные переходы статуса через `BEGIN IMMEDIATE`; `AUTHORIZED` только через `confirm_hh_account_authorized()` (`database.py:1418-1509`).
+- Fail-closed session check (`hh_client.py:917-964`) и runtime gate (`runtime_context.py:186-197`).
+- `submit_application()` отвергает permit с чужим `telegram_user_id` (`hh_client.py:1345-1357`).
+- Production `main.run()` проверяет владение до `create_browser_backend()` и `backend.start()` (`main.py:566-652`).
+- Путь профиля по умолчанию детерминирован: `hh-account-{int(id)}` (`main.py:517-524`), сохраняется и перепроверяется до запуска (`main.py:578-617`).
+- Строки ошибок в БД ограничены безопасными константами; в БД нет cookie/token/password/storage_state.
+
+---
+
+## 4. Detailed findings
+
+### P58-01 — HIGH — Database HH-account API не различает «субъект» и «цель»
+
+- **Где:** `database.py`: `create_hh_account` 1229-1263, `get_hh_account` 1265-1273, `get_or_create_hh_account` 1275-1311, `get_hh_account_model` 1313-1320, `update_hh_account` 1351-1382, `_write_hh_account_fields` 1384-1416, `_transition_hh_account_status` 1418-1462, `transition_hh_account` 1464-1487, `confirm_hh_account_authorized` 1489-1509, `delete_hh_account` 1511-1520. Единственныйownership-gate — `runtime_context.py:20-62`, но `Database` его не вызывает.
+- **Воспроизведение:** получить `Database` handle и выполнить `db.confirm_hh_account_authorized(43, ...)`, `db.update_hh_account(43, browser_profile_dir=...)`, `db.delete_hh_account(43)`. Все операции успешны: параметр `telegram_user_id` трактуется как исполнитель.
+- **Влияние:** любой in-process код может выдать себя за любого Telegram-пользователя, подменить статус AUTHORIZED, перенаправить профиль или удалить чужой аккаунт. Существующие тесты типа `tests/test_database.py:765-774` проверяют только то, что `update_hh_account(99)` не трогает строку 42, но не проверяют передачу `42` чужим вызывающим.
+- **Исправление:** ввести authenticated principal и ownership-facade с парой `(actor_id, target_id)`; все HH-записи сделать с `WHERE id = ? AND telegram_user_id = ?` по образцу `get_hh_account_by_id:1343-1346`; сырые id-keyed методы сделать приватными и убрать из внешних поверхностей.
+- **Нужен тест:** для read/update/transition/confirm/delete проверить отказ при `(actor != target)` и статическую проверку, что production-модули не вызывают сырые write-методы напрямую.
+
+### P58-02 — HIGH — Сохранённый `browser_profile_dir` принимается без containment/uniqueness
+
+- **Где:** `database.py:549-568` (колонка без `UNIQUE`/CHECK), `database.py:1229-1263` и `1351-1382` (запись произвольной строки), `runtime_context.py:56-60` (равенство объекта и строки БД), `main.py:500-524` (`_hh_account_profile_dir`: строка из БД возвращается как есть), `main.py:650-652`, `browser_backend.py:176-207`, `security_utils.py:295-309` и `746-759`.
+- **Воспроизведение:** `db.update_hh_account(42, browser_profile_dir=str(root / "hh-account-43"))`; затем запустить агента для 42. `verify_hh_account_ownership()` пройдёт, потому что объект и строка БД совпадают; `main.py:650` откроет профиль 43.
+- **Влияние:** полное crossover HH-сессии: cookie/localStorage/IndexedDB другого аккаунта. Абсолютный путь вне каталога профилей также принимается.
+- **Исправление:** валидировать путь при записи и чтении: lexical canonicalization, строгий containment под `settings.browser_profile_dir`, точное совпадение с `hh-account-{id}`, `UNIQUE(browser_profile_dir)`; в `_hh_account_profile_dir` выводить/отвергать, а не доверять.
+- **Нужен тест:** `test_run_rejects_stored_profile_outside_root`, duplicate-path, absolute-path; проверить, что `create_browser_backend` и `backend.start()` не вызываются.
+
+### P58-03 — HIGH — `HHClient` не привязан к живому browser context
+
+- **Где:** `hh_client.py:499-556` (`__init__`), `516` (`self.context = context`), `520`, `526-536` (ownership account), `971-1040` (`_invalidate_session_unlocked`), `940-947` (session check), `1387-1404` (submit); `main.py:650-670` (создание context/client).
+- **Воспроизведение:** сконструировать `HHClient` для user 42 с валидным `account_42`, но передать `context` от user 43. Проверка владения account пройдёт; `logout()` очистит cookie 43 и изменит статус 42; `check_session()` может авторизовать 42 по странице 43; submit кликнет в сессии 43.
+- **Влияние:** cross-account session mutation при любом будущем прямом или direct caller, который комбинирует валидный аккаунт и чужой context. Production сейчас избегает этого порядком в `main.py`, но сам `HHClient` гарантии не даёт.
+- **Исправление:** передавать в `HHClient` immutable descriptor `(account_id, telegram_user_id, verified_profile_dir)` и проверять соответствие context/profile до первой операции; или выводить context внутри клиента из проверенного профиля.
+- **Нужен тест:** foreign-context logout/session/submit rejection; проверить, что до чтения/Delete cookie выбрасывается `HHAccountOwnershipError`.
+
+### P58-04 — HIGH — `vacancies` has global primary key; `search_vacancies()` использует ownerless `get()`
+
+- **Где:** `database.py:394-397` (`vacancies.id TEXT PRIMARY KEY`, `telegram_user_id INTEGER` nullable), `database.py:2097-2105` (`discover()` `INSERT OR IGNORE`), `database.py:2185-2196` (`get()` optional owner), `hh_client.py:1146-1156` (`search_vacancies()` вызывает `self.database.get(job_id)` без владельца), `main.py:117`, `135-145`.
+- **Воспроизведение:** user 42 обнаружил задание `J` и получил `PENDING_APPROVAL`. User 43 ищет `J`: `get(job_id)` без owner возвращает строку 42; `previously_sent=True`; `process_vacancy()` получает `None` на `main.py:117` и игнорирует его на `119-120`; `discover(..., 43)` является no-op из-за глобального PK.
+- **Влияние:** cross-account starvation и влияние чужого статуса на выдачу/счётчики; legacy `NULL`-owner строки видны всем.
+- **Исправление:** составной ключ `(telegram_user_id, vacancy_id)` или эквивалентная схема; обязательный owner во всех вызовах `HHClient` → `Database`; миграция/quarantine `NULL`-owner строк.
+- **Нужен тест:** два пользователя обнаруживают один `job_id`; проверить две независимые строки и отсутствие `previously_sent` от чужой строки.
+
+### P58-05 — HIGH — Bound callbacks `request_captcha` и `notify` имеют несовместимую сигнатуру
+
+- **Где:** `main.py:128` — `hh_client.read_vacancy(summary, telegram.request_captcha)`; `main.py:335` — `hh_client.check_messages(telegram.notify)`; `tg_bot.py:623-625` — `request_captcha(..., *, telegram_user_id: int)`; `tg_bot.py:590` — `notify(text, *, telegram_user_id: int)`; `hh_client.py:372` — `CaptchaSolver = Callable[[Path, str, int], Awaitable[str | None]]`; `hh_client.py:1321-1323` — вызов solver с тремя позиционными аргументами; `hh_client.py:1576` — `await notifier(text)`; `hh_client.py:1577-1580` — исключение глотается.
+- **Воспроизведение:** реальный агент доходит до CAPTCHA: `_solve_captcha` вызывает bound method с тремя args → `TypeError: missing 1 required keyword-only argument: 'telegram_user_id'`. Для messages `TypeError` возникает в `notify` и молча подавляется.
+- **Влияние:** CAPTCHA-исключение проходит через `process_vacancy` → `run_search_cycle` catch/rethrow (`main.py:336-339`, `374-379`) → `agent_loop` → `asyncio.gather` (`main.py:703-709`). Браузер закроется в `finally`, polling continue на закрытой сессии (`tg_bot.py:683-695`). В многопользовательском процессе один CAPTCHA останавливает работу всех. Сообщения уведомляются нулю пользователей.
+- **Исправление:** `functools.partial(telegram.request_captcha, telegram_user_id=target_user_id)` и `functools.partial(telegram.notify, telegram_user_id=target_user_id)`; лучше — явно включить user id в protocol и проверить `hh_client.telegram_user_id == context.telegram_user_id`.
+- **Нужен тест:** реальный `TelegramService` + fake bot + CAPTCHA/message badge; проверить future под владельцем, chat id и что чужой future не тронут.
+
+### P58-06 — MEDIUM — `chat_messages` dedupe глобальна и не привязана к пользователю
+
+- **Где:** `database.py:385-391` (`msg_id TEXT PRIMARY KEY`, нет owner), `database.py:2787-2802` (`is_message_processed`, `add_processed_message` без user id), `hh_client.py:1554-1582` (`check_messages`).
+- **Воспроизведение:** сообщение с одинаковым `href:title` для двух аккаунтов: первый вызов `add_processed_message` помечает `msg_id`; второй `is_message_processed()` возвращает `True` и уведомление не отправляется. Из-за P58-05 первое уведомление к тому же не доходит.
+- **Влияние:** глобальное подавление уведомлений между аккаунтами; потеря event'а из-за ordering `mark → notify`.
+- **Исправление:** добавить `telegram_user_id` в `chat_messages` и в оба метода; ключ `(telegram_user_id, msg_id)`; передавать `self.telegram_user_id`; помечать processed только после успешной отправки.
+- **Нужен тест:** одинаковое сообщение для 42 и 43 → два уведомления; failed notify → строка не помечается.
+
+### P58-07 — MEDIUM — Гонка `/logout`, `/resume` и `session_watchdog` над auth state
+
+- **Где:** `tg_bot.py:135-165` (`_logout`), `167-203` (`_resume`); `main.py:397-436` (`apply_session_state`), `439-463` (`session_watchdog`); `hh_client.py:966-969` (lock только в `check_session`), `1042-1076` (logout); `runtime_context.py:186-197`.
+- **Воспроизведение A:** watchdog начал `check_session()` и увидел `AUTHORIZED`; затем `/logout` очистил сессию и поставил `auth_paused=True`; watchdog применяет stale `AUTHORIZED` последним и снимает `auth_paused`.
+- **Воспроизведение B:** параллельные `/resume` и `/logout`: результат каждого пишется после await без ordering token; last writer wins.
+- **Влияние:** разлогиненная/неподтверждённая сессия снова считается authorized до следующего тика; fail-closed дизайн Phase 5.6 обходится. Per-user, но опасно.
+- **Исправление:** единая per-user auth lock или monotonic generation, захваченный до await и проверенный перед `apply_session_state`; применять состояние, удерживая `context.session_lock`.
+- **Нужен тест:** barrier: заблокировать watchdog check, выполнить `/logout`, release с `AUTHORIZED`; assert `auth_paused is True`.
+
+### P58-08 — MEDIUM — Ниже transport layer `telegram_user_id` остаётся обычным int
+
+- **Где:** `runtime_context.py:20-62`, `149-183`; `hh_client.py:499-536`; `tg_bot.py:102-133`, `205-309`; `approval.py:101-129`; `main.py:527`, `743-764`.
+- **Воспроизведение:** `create_runtime_context(victim_id, settings, db, hh_account=victim_account)` или `telegram.command_async("logout", victim_id)` выполняется без доказательства, что вызывающий — этот user. `main.run()` получает id из CLI `--telegram-user-id`, то есть от оператора, не от аутентифицированного sender'а.
+- **Влияние:** любой in-process caller может управлять чужой сессией/командами; проверка подтверждает согласованность с *claimed* id, но не личность вызывающего.
+- **Исправление:** пронести authenticated principal из aiogram handler'а в `command*`, `create_runtime_context`, `HHClient`, `ApprovalService`; сделать id immutable и доступным для установки только проверенному handler code; повторно проверять `authorized()` в `run()`.
+- **Нужен тест:** передача чужого id с поддельным `HHAccount` и совпадающей строкой БД должна отвергаться.
+
+### P58-09 — MEDIUM — Startup игнорирует `is_active` и `TG_USER_ID`
+
+- **Где:** `main.py:566-567` (создаёт user + HH account для любого CLI id), `main.py:732-764` (CLI), `database.py:487` (`is_active DEFAULT 1`), `database.py:801-818` и `859-890` (создание/изменение active), `tg_bot.py:78-80` (`authorized` = `is_active == 1`), `tg_bot.py:213-227` (`/start`), `setup_wizard.py:328-341` (пишет `TG_USER_ID`), `.env.example:2`; в `config.py` нет ссылок на `TG_USER_ID`.
+- **Воспроизведение:** `db.set_user_active(43, False)`, затем `python main.py --telegram-user-id 43` — агент всё равно стартует, создаёт/открывает профиль и позволяет search/submit. Отдельно: любой Telegram user при `/start` получает `is_active=1`, поэтому `PRIVATE_REPLY` практически недостижим.
+- **Влияние:** деактивация не останавливает background agent; configured owner id не ограничивает доступ к боту.
+- **Исправление:** в `run()` загружать `get_user()` и требовать `is_active == 1` плюс allowlist `TG_USER_ID`; добавить `TG_USER_ID` в `config.py` и проверять в `authorized()`.
+- **Нужен тест:** startup с inactive/non-allowlisted id прерывается до DB writes и browser; command от non-allowlisted id rejected.
+
+### P58-10 — MEDIUM — Legacy `telegram_user_id IS NULL` vacancy rows остаются общими
+
+- **Где:** `database.py:395-397`, `1919-1922`, `1949-2007`, `2185-2218`, `2242-2247`, `2259-2275`, `2345-2363`, `2597-2612`, `2631-2635`; `approve()` явно допускает `NULL` на `2311-2312`; `stats` уже строгий на `2648`.
+- **Воспроизведение:** создать `PENDING_APPROVAL` vacancy с `telegram_user_id = NULL`; active user 43 отправляет `apply:<id>`/`skip:<id>`; `approve`/`skip` принимают строку и проставляют `approver_id = 43`.
+- **Влияние:** cross-user approve/skip и accounting дневного лимита по чужим legacy-строкам. Текущие handler'ы такие строки не создают, но legacy DB/closed caller могут.
+- **Исправление:** backfill или quarantine NULL-owner; убрать `OR telegram_user_id IS NULL` из user-scoped операций; reject в `approve`, `skip`, `_callback_handler`.
+- **Нужен тест:** NULL-owner pending + callback от 43 → отказ, строка неизменна, notification не отправлен.
+
+### P58-11 — MEDIUM — Один `ApprovalService`/sender на всех callback-пользователей
+
+- **Где:** `main.py:691-699` (создание и инъекция одного сервиса); `tg_bot.py:51`, `57`, `62-75` (maps contexts/clients/senders), `411-423` (проверка sender), `437`, `453` (всегда `self.approval_service`); `approval.py:96-123`.
+- **Воспроизведение:** в гипотетической multi-user dispatch у user 43 будет валидный callback — identity gate отклонит его, потому что sender принадлежит 42. Если подменить sender, `user_settings` сервиса останутся от 42 (`app_mode`, `enable_real_apply`, TTL, daily limit).
+- **Влияние:** функциональный отказ multi-user approval и риск применения чужих настроек. Текущий `run()` подключает только одного пользователя, поэтому это архитектурный разрыв, не подтверждённый удалённый exploit.
+- **Исправление:** хранить `dict[int, tuple[UserRuntimeContext, HHClient, ApprovalService, TelegramSender]]`; выбирать по `callback.from_user.id`; требовать identity `user_settings is context.user_settings`.
+- **Нужен тест:** два пользователя с разными settings; callback каждого вызывает только свой сервис/sender; чужой `job_id` отклоняется БД.
+
+### P58-12 — MEDIUM — `/start` регистрирует пользователя, но не создаёт runtime context
+
+- **Где:** `tg_bot.py:213-227`; `tg_bot.py:82-91` (`_runtime_context`), `42` (`NO_RUNTIME_REPLY`), `137`, `169`, `232`, `240`, `269`; `main.py:533-550` (polling-only mode с `contexts={}`), `638-644` (единственное production construction); `tests/test_tg_bot.py:547-553` (тест вручную добавляет недостающий context).
+- **Воспроизведение:** polling-only mode, новый user sends `/start`, затем `/status`/`/pause`: DB-команды работают, runtime-команды отвечают `NO_RUNTIME_REPLY` бесконечно.
+- **Влияние:** регистрация и runtime ownership расходятся; multi-account bot не может динамически создавать аккаунты.
+- **Исправление:** создавать проверенные per-user context/client на `/start` или явно задокументировать/проверять контракт «registration does not start an agent».
+- **Нужен тест:** после реального `/start` проверить либо наличие context, либо стабильный явный отказ; context 42 не изменён.
+
+### P58-13 — MEDIUM — Session lock process-local; часть browser-операций без lock
+
+- **Где:** `hh_client.py:513` и `553` (lock может быть заменён новым `asyncio.Lock()`), `650-653` (`ensure_login`), `966-969` (`check_session`), `1042-1044` (`logout`), `1345-1357` (`submit_application`), `1096-1184` (`search_vacancies`), `1186-1273` (`read_vacancy`), `1275-1313` (`read_company_details`), `1554-1582` (`check_messages`); `runtime_context.py:111-115`; `main.py:527`, `669`, `743-747`.
+- **Воспроизведение:** два `HHClient` для одного аккаунта без явного lock не сериализуются; два OS-процесса с одним профилем не имеют общего lock.
+- **Влияние:** logout cleanup может гоняться с submit/session check; возможен stale authorization и/port profile race.
+- **Исправление:** process-wide registry lock по `(telegram_user_id, hh_account.id)` плюс cross-process lock/single-instance guard; сделать lock обязательным или выводимым, а не optional.
+- **Нужен тест:** same-account multi-client и multi-process lock tests.
+
+### P58-14 — MEDIUM — Неполный cascade/orphan handling; нет user delete и cleanup профиля
+
+- **Где:** `database.py:397` (`vacancies.telegram_user_id` без FK), `1880-1894` (`_migrate_search_runs_user_id`: `ALTER TABLE ADD COLUMN` без FK), `565-567` (`hh_accounts ON DELETE CASCADE`), отсутствует `DELETE FROM users` в исходниках; нет cleanup `browser_profile_dir`.
+- **Воспроизведение:** удалить user вручную SQL → `hh_accounts` каскадируется, но `vacancies`/legacy `search_runs` остаются сиротами; каталог профиля с HH-сессией остаётся на диске; повторная регистрация создаёт новый `hh_accounts.id` и новый каталог.
+- **Влияние:** DB/filesystem divergence, stale HH sessions, pollution user-scoped analytics/limits.
+- **Исправление:** `delete_user`, удаление всех user-scoped таблиц в одной транзакции и профиля; FK для `vacancies.telegram_user_id`; rebuild таблицы `search_runs` с FK при миграции.
+- **Нужен тест:** delete user → zero rows во всех user-scoped таблицах и profile dir удалён; проверить `PRAGMA foreign_key_list(search_runs)`.
+
+### P58-15 — MEDIUM/LOW — TOCTOU между валидацией профиля и launcher; recursive ACL path-based
+
+- **Где:** `browser_backend.py:50-83`, `129-154` (валидация, затем передача `str(profile_dir)` в launcher); `security_utils.py:295-309`, `746-759`, `786-807`, `815-825`, `1004-1014`, `1083-1096`, `1209-1211`.
+- **Воспроизведение:** локальный субъект с правом менять каталог подменяет компонент пути на junction между `ensure_validated_directory()` и вызовом launcher'а; браузер открывает чужой профиль. Recursive protection проверяет `_iter_tree()`, но chmod/ACL применяет по пути.
+- **Влияние:** redirect launch/ACL write; particularly relevant given same-OS-user threat model.
+- **Исправление:**Restrict root ACL, держать handle/lock и повторно проверять непосредственно перед launch; перейти на handle-relative `fchmod`/`SetSecurityInfo(handle)` для recursive mode.
+- **Нужен тест:** подмена child после первой проверки → вторая проверка блокирует; race test для swapped child mode.
+
+### P58-16 — LOW — Cached `start()` пропускает валидацию; backend factory не имеет ownership binding
+
+- **Где:** `browser_backend.py:51-52`, `130-131` (ранний return если `_context is not None`), `176-207` (`create_browser_backend`); `tests/test_browser_backend.py:199-208` явно утверждает отсутствие `database`/`approval` у backend'ов.
+- **Воспроизведение:** после первого успешного `start()` заменить профиль symlink и вызвать `start()` снова — весь context возвращается без повторной проверки. Напрямую `create_browser_backend(settings, profile_dir=any_path)` запускает произвольный путь.
+- **Влияние:** latent path для будущих caller'ов; не подтверждённый текущий production exploit.
+- **Исправление:** валидировать при каждом `start()` или делать backend одноразовым; требовать `VerifiedProfilePath` от ownership verifier вместо raw `Path`.
+- **Нужен тест:** второй `start()` вызывает validation; factory без токена отвергается.
+
+### P58-17 — LOW — `HHClient` identity mutable; global `Settings` смешаны с per-user settings
+
+- **Где:** `hh_client.py:516-520` (`telegram_user_id`, `context`, `settings`), `528-536` (`hh_account`), `541-543` (`user_settings`), `558-561`, `1109`, `1151`, `1317-1322`; контраст: `runtime_context.py:139-146`; `config.py:58-74`, `106-142`.
+- **Воспроизведение:** изменить `client.telegram_user_id` и `client.hh_account`, оставив старый `context` → воспроизведение P58-03. Per-user throttle/page/captcha/headless сейчас берутся из global `Settings`.
+- **Влияние:** возможен re-point client; невозможна действительно per-user конфигурация.
+- **Исправление:** freeze identity fields или immutable binding object; перенести user-specific поля в `UserSettings`.
+- **Нужен тест:** mutation attempts rejected; two users с разными limits получают разные значения.
+
+### P58-18 — LOW — Callback data unsigned, без user/account binding, nonce и expiry
+
+- **Где:** `tg_bot.py:424-434` (парсинг/валидация), `540-553` (`apply:<vacancy.id>`, `skip:<vacancy.id>`); defense in depth — `database.py:2294-2420`.
+- **Воспроизведение:** переслать/повторить callback другого пользователя; защита зависит только от DB owner check, а для NULL-owner строк он обходится (P58-10).
+- **Влияние:** replay/forwarding; account_id в callback отсутствует, поэтому «подмена account_id» через этот канал невозможна.
+- **Исправление:** формат `job_id:user_id:nonce:expiry:HMAC` или привязка к chat/message id; rejection до вызова `ApprovalService`.
+- **Нужен тест:** forwarded/replay callback от user B → reject.
+
+### P58-19 — LOW — Глобальное состояние update notifications и untracked task
+
+- **Где:** `tg_bot.py:69-70` (`latest_release`, `_notified_release_tag`), `645-662` (`check_updates`), `273-274`, `314-315`, `697-700` (`stop()` не отменяет task); `main.py:548`, `702` (fire-and-forget).
+- **Воспроизведение:** два пользователя: после уведомления первого второй не получает update, потому что `_notified_release_tag` глобален; pending task может пережить shutdown.
+- **Влияние:** incorrect UX, resource leak. Изоляции аккаунтов не нарушает.
+- **Исправление:** key notified state по `telegram_user_id`; хранить и awaited/cancelled task в cleanup `run()`.
+- **Нужен тест:** два пользователя уведомляются независимо; после `run()` нет pending tasks.
+
+### P58-20 — LOW — Часть ошибок содержит raw path/exception text
+
+- **Где:** `security_utils.py:228`, `245`, `258`, `436`, `781` (полный `{path}` в `FilesystemProtectionError`); `config.py:271`, `284`, `343`; `browser_backend.py:205-206` (raw `ValueError`).
+- **Воспроизведение:** вызвать защищённую операцию с «secret-looking» путём или неизвестный backend и вывести `str(exc)`/CLI stderr: `redact_sensitive_text()` маскирует secrets, но не абсолютные пути, а `ConfigError` собирает `str(exc)`.
+- **Влияние:** disclosure путей/внутренних деталей. Cookie/token в этих сообщениях не найден; browser launch errors санитизируются через `safe_exception_message()`.
+- **Исправление:** использовать `safe_exception_message()` и `path.name` в user-visible errors.
+- **Нужен тест:** assert отсутствия absolute temp path в `str(exc)` и CLI stderr.
+
+### P58-21 — MEDIUM (test-quality) — Обязательные сценарии #3/#4/#11/#13/#15 не подтверждены; часть тестов даёт false positive
+
+- **Где:** пропущенные сценарии: credentials — нет теста (ближайшие `tests/test_security_phase57.py:800-840`, `1046-1090`, `963-1008` не проверяют чтение чужих credentials); session load — только partial (`tests/test_hh_client.py:995-1004`, `1551-1566`; `tests/test_multi_user_integration.py:1654-1719`, `1878-1925`); expiration — single-user only (`tests/test_hh_client.py:1530-1549`, `1551-1566`; `tests/test_database.py:1831-1848`); delete account — `database.delete_hh_account` определена на `database.py:1511`, но не имеет ни одного упоминания в `tests/`; background tasks — `tests/test_main.py:1411-1450` single-user.
+- **False-positive-prone:** `tests/test_main.py:1199-1224` monkeypatch'ит `create_runtime_context`, а не реальную проверку; `tests/test_security_phase57.py:922-960` monkeypatch'ит `verify_hh_account_ownership`; `tests/test_security_phase57.py:1982-1988` использует `object.__new__(HHClient)`; `tests/test_multi_user_integration.py:1017-1136` использует fake client; `tests/test_database.py:752-762` имеет инвертированное имя.
+- **Воспроизведение:** прочитать тесты; убрать/ослабить проверку в коде — часть тестов продолжит проходить.
+- **Влияние:** наличие тестов не доказывает изоляцию; Phase 5.8 может дать ложно-зелёный результат.
+- **Исправление/нужен тест:** добавить явные negative tests для 3/4/11/13/15, заменить monkeypatch на реальные forged accounts и real `TelegramService` callbacks, добавить проверки foreign-context и cross-user expiration.
+
+---
+
+## 5. Обязательная таблица сценариев Phase 5.8
+
+| Проверка | Реализована | Тестируется | Недостатки |
+|---|---|---|---|
+| 1. A не может получить HH-аккаунт B | Да | Да | `tests/test_database.py:752-762`, `1504-1536`, `1539-1568`; имя первого теста инвертировано. Защита на уровне `get_hh_account_by_id(id, owner)`; прямые raw DB API остаются (P58-01). |
+| 2. A не может использовать `account_id` B | Да | Да | `tests/test_database.py:1525-1536`; `tests/test_runtime_context.py:413-422`; `tests/test_hh_client.py:1024-1040`; `tests/test_main.py:1114-1142`; `tests/test_multi_user_integration.py:1509-1513`. Чужой id требует пару с owner. |
+| 3. A не может получить credentials B | Частично | Нет | В БД нет cookie/token/password (по дизайну); session живёт в profile. Нет negative test на чтение/profile storage; P58-03 позволяет потенциальный context swap. |
+| 4. A не может загрузить сессию B | Частично | Частично | `tests/test_hh_client.py:995-1004`, `1551-1566`; `tests/test_multi_user_integration.py:1654-1719`, `1878-1925`. Нет теста, где A пытается загрузить session B и получает отказ до чтения файлов. |
+| 5. A не может использовать browser-профиль B | Да* | Да | `tests/test_runtime_context.py:437-449`; `tests/test_hh_client.py:1043-1062`; `tests/test_main.py:1145-1174`; `tests/test_multi_user_integration.py:1515-1528`. `*` — только для многослойных ownership checks; сохранённый путь из БД может быть подменён (P58-02). |
+| 6. HHClient A не работает в context B | Да | Да | `tests/test_hh_client.py:1006-1021`; `tests/test_multi_user_integration.py:1530-1539`; `tests/test_security_phase57.py:922-940`; `tests/test_tg_bot.py:1222-1246`. Но живой browser context не привязан к client (P58-03). |
+| 7. Подмена `telegram_user_id` | Да | Да | `tests/test_security_phase57.py:1932-1979`; `tests/test_database.py:220-251`; `tests/test_tg_bot.py:145-153`. Защита от dispatch-level подмены; in-process caller всё ещё authoritative (P58-08). |
+| 8. Подмена runtime context | Да | Да | `tests/test_runtime_context.py:425-434`, `464-516`; `tests/test_main.py:1177-1224`. frozen fields есть, но `settings/database/user_settings/auth_*` остаются mutable. |
+| 9. Concurrent ops не смешиваются | Да | Да | `tests/test_multi_user_integration.py:1017-1237`; `tests/test_main.py:519-563`; `tests/test_database.py:799-822`. Тесты используют fake clients и barrier; реальный Playwright context sharing не проверен (P58-13). |
+| 10. Logout A не влияет на B | Да | Да | `tests/test_multi_user_integration.py:1878-1925`, `1958-1966`; `tests/test_security_phase57.py:963-1008`; `tests/test_tg_bot.py:986-998`. Есть риск гонки watchdog/logout (P58-07). |
+| 11. Expiration A не влияет на B | Частично | Нет | Логика per-user есть, но нет двух-user expiration теста. Ближайшие: `tests/test_hh_client.py:1530-1566`, `tests/test_database.py:1831-1848`. См. P58-07. |
+| 12. Ownership error blocks BrowserBackend launch | Да (в production path) | Да | `tests/test_main.py:1063-1224`; `tests/test_multi_user_integration.py:1477-1596`; `tests/test_security_phase57.py:1683-1709`. Гарантия процедурная в `main.run()`, не intrinsic backend (P58-16). |
+| 13. Delete A не удаляет B | Да | Нет | `database.delete_hh_account` на `database.py:1511`, но тестов нет. Также нет cleanup profile и `delete_user` (P58-14). |
+| 14. Re-auth A не меняет B | Да | Да | `tests/test_multi_user_integration.py:1654-1756`; `tests/test_database.py:1635-1673`, `1831-1848`. Status transitions атомарны и user-scoped. |
+| 15. Background tasks не используют context B | Частично | Нет | Per-user context propagation в `main.py:110`, `243`, `382`, `471` есть; нет cross-user watchdog test. `tests/test_main.py:1411-1450` single-user. См. P58-05/P58-07. |
+
+Итого: **11/15** имеют реальное покрытие, **4/15** отсутствуют (#3, #11, #13, #15), **#4** покрыто только частично.
+
+---
+
+## 6. Проверка «браузер не запускается при отказе владения»
+
+Ответ: **да, в единственном production-пути; нет как свойство `browser_backend`**.
+
+Trace:
+
+1. `main.py:732-774` → `cli()` → `asyncio.run(run(..., telegram_user_id=args.telegram_user_id))` (`main.py:764`).
+2. `main.py:533-550`: polling-only mode возвращается до любого backend.
+3. `main.py:557-560`: создаётся/защищается root профилей (filesystem side effect, без launch).
+4. `main.py:566-576`: `verify_hh_account_ownership()` — первый gate.
+5. `main.py:578-617`: путь генерируется, сохраняется, перечитывается, перепроверяется.
+6. `main.py:638-644`: `create_runtime_context()` → `UserRuntimeContext.__post_init__` (`runtime_context.py:128-137`) — второй gate.
+7. `main.py:650`: `profile_dir = Path(hh_account.browser_profile_dir)`.
+8. `main.py:651`: `create_browser_backend(...)`.
+9. `main.py:652`: `browser_context = await backend.start()` — первый и единственный launch.
+10. Внутри `backend.start()`: Cloak `browser_backend.py:57-60` validation/protection → `69-72` launcher; Playwright `136-139` → `141-146` launcher → `_launch()` `109-127` (`async_playwright().start()` на `117`, `launch_persistent_context()` на `120-123`).
+
+Любой отказ на шагах 4-6 происходит до 650/651/652. Отказ filesystem validation внутри `start()` происходит до launcher. Это закреплено тестами `tests/test_main.py:1085-1174`, `1177-1224` и `tests/test_security_phase57.py:1683-1709`.
+
+Оговорки: `HHClient.__init__` проверяет ownership на `hh_client.py:526-536`, то есть **после** launch, и не является launch-guard; `browser_backend` factory/start() могут запустить любой path при прямом вызове; cached `start()` пропускает re-validation.
+
+---
+
+## 7. Seven mandatory conclusions
+
+1. **Архитектура изоляции в основном реализована, но не как полная граница безопасности.** Есть immutable runtime identity, dual-id DB lookup, ownership checks, per-user locks/settings и filesystem hardening Phase 5.7. В то же время down-stream API принимают ordinary int и не несут authenticated principal (P58-01, P58-08).
+2. **Владение HH-аккаунтом проверяется в базовой production-цепочке, но не в `Database`.** `verify_hh_account_ownership()` и `get_hh_account_by_id(id, owner)` работают, однако любые прямые HH-account write/transition/delete операции ключуются только по переданному `telegram_user_id` (P58-01).
+3. **Браузерный профиль изолирован только логически.** Путь `hh-account-{id}` детерминирован и защищён от symlink/reparse подмен, но сохранённый путь принимается без containment/uniqueness, а ACL защита ограничена одним OS user (P58-02, P58-15, `SECURITY.md:27-29`).
+4. **Гарантия «нет браузера при ownership failure» выполнена в `main.run()`, но не инкапсулирована.** Порядок проверок до `backend.start()` корректен и покрыт тестами; фабрика/бэкенд и cached start такой гарантии не имеют (P58-16).
+5. **Меж-user data isolation имеет три материальных разрыва:** глобальный PK `vacancies` + ownerless `get()` (P58-04), глобальный `chat_messages` dedupe (P58-06) и legacy `NULL`-owner vacancy rows (P58-10). Это может вызвать cross-account starvation и подавление/подмену уведомлений.
+6. **Обработка Telegram и auth state содержит functional/security баги:** несовместимые bound callbacks (P58-05), гонка watchdog/logout (P58-07), единый ApprovalService (P58-11), `/start` без runtime (P58-12), отсутствие signed callback (P58-18), ignore `is_active`/`TG_USER_ID` (P58-09).
+7. **Решение по Phase 5.8: УСЛОВНО / NO-GO как по доказательству изоляции.** Diagnostic tests можно запускать только в изолированном окружении и не считать их доказательством до закрытия High-находок P58-01…P58-05 и добавления missing scenarios #3/#4/#11/#13/#15. Перед тем как считать Phase 5.8 security gate, необходимы исправления и повторный read-only audit.
+
+---
+
+## 8. Artifacts
+
+Созданы в `C:\Users\khudo\Documents\Проект по умолчанию\phase58_audit\`:
+
+- `PHASE58_AUDIT.md` — настоящий отчёт.
+- `phase58_audit_bundle.zip` — архив с production source, tests, config/docs, baseline/Phase 5.7 description, versions/dependencies, `phase57.patch` и `MANIFEST.txt`.
+- `BASELINE_AND_PHASE57.md` — description baseline и patch verification.
+- `PROJECT_STRUCTURE.txt` — project structure и exclusions.
+- `VERSIONS_AND_DEPENDENCIES.md` — versions/dependencies.
+- `MANIFEST.txt` — список 40 bundled files с размером и SHA256, плюс self-entry note.
+
+`PHASE58_AUDIT.md` намеренно **не** включён в ZIP, чтобы не создавать self-referential SHA256.
+
+Bundle composition (41 entry total, including MANIFEST.txt):
+
+- production `.py`: 15 files;
+- tests: 12 files;
+- config/docs: 10 files;
+- `phase57.patch`;
+- service docs inside bundle: `BASELINE_AND_PHASE57.md`, `PROJECT_STRUCTURE.txt`, `VERSIONS_AND_DEPENDENCIES.md`;
+- `MANIFEST.txt`.
+
+Excluded by policy: `.env`, credentials/cookies/session data, user DBs, profiles/results, `.browser-profile*`, `.venv`, `__pycache__`, `.pytest_cache`, `.git`, logs, captured ANSI diff artifact.
+
+**SHA256 `phase58_audit_bundle.zip`:** `620D3FA84B6B3817BEF6563729CD8FE58C72C9677779F061B1C8E85D0001EEA7`
+
+---
+
+Конец отчёта. Ни один production/test/manifest artifact в исходном проекте не был изменён; рабочее дерево осталось в том же состоянии.
+
+
+
+
+
+
+
+
+
+
+
+
+
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
