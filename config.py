@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Mapping
 
 import yaml
 from dotenv import dotenv_values
+
+from security_utils import (
+    FilesystemProtectionError,
+    protect_config_file,
+    read_validated_text,
+    validate_path_before_io,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -152,6 +160,18 @@ def _text(section: Mapping[str, object], key: str, default: str = "") -> str:
     return value.strip()
 
 
+def _read_env_values(path: Path) -> dict[str, str]:
+    """Read a .env file through a handle whose final object was verified."""
+    content = read_validated_text(path, kind="configuration file")
+    if content is None:
+        return {}
+    return {
+        key: value
+        for key, value in dotenv_values(stream=StringIO(content)).items()
+        if value is not None
+    }
+
+
 def load_settings(
     env_path: Path | str = BASE_DIR / ".env",
     profile_path: Path | str | None = None,
@@ -159,21 +179,15 @@ def load_settings(
 ) -> Settings:
     values: dict[str, str] = {}
     resolved_env_path = Path(env_path)
+    # Even when values come from ``environ``, later protection touches this
+    # path with is_file()/protect_config_file().  Validate it before that.
+    validate_path_before_io(resolved_env_path, kind="configuration file")
     if environ is None:
-        if resolved_env_path.exists():
-            values = {
-                key: value
-                for key, value in dotenv_values(resolved_env_path, encoding="utf-8").items()
-                if value is not None
-            }
+        values = _read_env_values(resolved_env_path)
         values.update(os.environ)
     else:
-        if resolved_env_path != BASE_DIR / ".env" and resolved_env_path.exists():
-            values = {
-                key: value
-                for key, value in dotenv_values(resolved_env_path, encoding="utf-8").items()
-                if value is not None
-            }
+        if resolved_env_path != BASE_DIR / ".env":
+            values = _read_env_values(resolved_env_path)
         values.update(environ)
     errors: list[str] = []
 
@@ -248,28 +262,47 @@ def load_settings(
 
     profile_explicitly_loaded = False
     raw_profile: object = {}
+    selected_profile: Path | None = None
 
     if profile_path is not None:
         selected_profile = Path(profile_path)
-        if not selected_profile.exists():
+        content = read_validated_text(selected_profile, kind="configuration file")
+        if content is None:
             errors.append(f"profile file not found: {selected_profile}")
         else:
             try:
-                raw_profile = yaml.safe_load(selected_profile.read_text(encoding="utf-8")) or {}
+                raw_profile = yaml.safe_load(content) or {}
                 profile_explicitly_loaded = True
-            except (OSError, yaml.YAMLError) as exc:
-                errors.append(f"cannot read profile: {exc}")
+            except yaml.YAMLError as exc:
+                # Never echo a parser error: YAML messages can quote the
+                # offending line, which may contain a secret.
+                errors.append(f"cannot read profile: {type(exc).__name__}")
     elif values.get("PROFILE_PATH"):
         selected_profile = _path(values["PROFILE_PATH"])
-        if not selected_profile.exists():
+        content = read_validated_text(selected_profile, kind="configuration file")
+        if content is None:
             errors.append(f"profile file not found: {selected_profile}")
         else:
             try:
-                raw_profile = yaml.safe_load(selected_profile.read_text(encoding="utf-8")) or {}
+                raw_profile = yaml.safe_load(content) or {}
                 profile_explicitly_loaded = True
-            except (OSError, yaml.YAMLError) as exc:
-                errors.append(f"cannot read profile: {exc}")
+            except yaml.YAMLError as exc:
+                errors.append(f"cannot read profile: {type(exc).__name__}")
     # else: no profile requested, raw_profile stays empty {}
+
+    # Phase 5.7: secure existing secret-bearing files without changing their
+    # format or location.  A protection failure is a configuration error, not
+    # a silent success.
+    for config_file in (resolved_env_path, selected_profile):
+        if config_file is None or not config_file.is_file():
+            continue
+        try:
+            protect_config_file(config_file)
+        except (FilesystemProtectionError, OSError) as exc:
+            errors.append(
+                f"cannot secure configuration file {config_file.name}: "
+                f"{type(exc).__name__}"
+            )
 
     if not isinstance(raw_profile, dict):
         errors.append("profile root must be a mapping")

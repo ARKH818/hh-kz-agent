@@ -19,7 +19,7 @@ from browser_backend import BrowserLaunchError, create_browser_backend
 from config import ConfigError, Settings, load_settings, load_user_settings
 from database import Database, HHAccount, HHAccountStatus, SearchRun, VacancyStatus
 from hh_client import HHClient, LoginState, PageState, VacancySummary
-from logging_setup import configure_logging
+from logging_setup import configure_logging, redact_sensitive_text, safe_exception_message
 from runtime_context import (
     HHAccountOwnershipError,
     UserRuntimeContext,
@@ -27,6 +27,7 @@ from runtime_context import (
     runtime_allows_hh_work,
     verify_hh_account_ownership,
 )
+from security_utils import ensure_validated_directory, protect_directory
 from tg_bot import TelegramService
 from vacancy_filter import title_rejection_reason
 from version import __version__
@@ -371,7 +372,11 @@ async def run_search_cycle(
         telegram_user_id=target_user_id,
     )
     if failure is not None:
-        raise failure
+        # The original exception may embed a URL with a session token.  Keep
+        # its type/identifier only; the safe error was already recorded.
+        raise RuntimeError(
+            safe_exception_message(failure, operation="search_cycle")
+        ) from None
     if notification:
         try:
             await telegram.notify(notification, telegram_user_id=target_user_id)
@@ -543,6 +548,16 @@ async def run(settings: Settings, telegram_user_id: int | None = None) -> None:
                 asyncio.create_task(telegram.check_updates(notify=True))
             await telegram.start_polling()
             return
+
+        # Phase 5.7: protect the browser profile root and every existing
+        # account profile before any account profile is selected or launched.
+        # Nothing is moved, renamed or deleted here.
+        # Each component is validated immediately before it is created; a
+        # junction in the profile root cannot redirect directory creation.
+        profile_root = ensure_validated_directory(
+            settings.browser_profile_dir, kind="browser profile root"
+        )
+        protect_directory(profile_root, recursive=True)
 
         # Phase 5.3: the HHAccount must exist before the browser starts,
         # because it owns the persistent browser profile directory.
@@ -734,7 +749,9 @@ def cli(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings(args.env_file, args.profile)
     except ConfigError as exc:
-        print(exc, file=sys.stderr)
+        # ConfigError text is built from field names, but pass it through the
+        # same redactor so an unexpected value can never reach the terminal.
+        print(redact_sensitive_text(exc), file=sys.stderr)
         return 2
     if args.check_config:
         print(
@@ -746,8 +763,11 @@ def cli(argv: list[str] | None = None) -> int:
     try:
         asyncio.run(run(settings, telegram_user_id=args.telegram_user_id))
     except (BrowserLaunchError, RuntimeError) as exc:
-        logger.error("startup_failed error=%s", exc)
-        print(exc, file=sys.stderr)
+        # Browser exceptions can contain full URLs, cookies and tokens.  Only
+        # the type and a controlled identifier are safe to log or display.
+        detail = safe_exception_message(exc, operation="startup")
+        logger.error("startup_failed %s", detail)
+        print(f"Startup failed: {detail}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         logger.info("agent_stopped")

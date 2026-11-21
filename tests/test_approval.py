@@ -269,7 +269,9 @@ def test_browser_error_after_claim_becomes_apply_failed(tmp_path: Path) -> None:
     vacancy = database.get("job-1")
     assert not sent
     assert vacancy.status is VacancyStatus.APPLY_FAILED
-    assert "navigation failed" in vacancy.error_text
+    assert "application_submit_failed" in vacancy.error_text
+    assert "RuntimeError" in vacancy.error_text
+    assert "navigation failed" not in vacancy.error_text
 
 
 def test_page_creation_error_after_claim_becomes_apply_failed(tmp_path: Path) -> None:
@@ -299,7 +301,9 @@ def test_page_creation_error_after_claim_becomes_apply_failed(tmp_path: Path) ->
     vacancy = database.get("job-1")
     assert not sent
     assert vacancy.status is VacancyStatus.APPLY_FAILED
-    assert "page creation failed" in vacancy.error_text
+    assert "application_submit_failed" in vacancy.error_text
+    assert "RuntimeError" in vacancy.error_text
+    assert "page creation failed" not in vacancy.error_text
 
 
 def test_missing_explicit_success_signal_fails_closed(tmp_path: Path) -> None:

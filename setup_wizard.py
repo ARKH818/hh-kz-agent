@@ -16,6 +16,12 @@ import sys
 import textwrap
 from pathlib import Path
 
+from logging_setup import safe_exception_message
+from security_utils import (
+    protect_config_file,
+    read_validated_text,
+    write_validated_text,
+)
 from version import __version__
 
 # ---------------------------------------------------------------------------
@@ -493,9 +499,15 @@ def step_app_mode(current: dict[str, str]) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _write_env(content: str) -> None:
-    ENV_PATH.write_text(content, encoding="utf-8")
-    if os.name != "nt":
-        ENV_PATH.chmod(0o600)
+    # The file is created/overwritten through an already-verified handle, so a
+    # symlink or junction substituted after preflight cannot redirect the write.
+    write_validated_text(ENV_PATH, content, kind="configuration file")
+    protect_config_file(ENV_PATH)
+
+
+def _write_profile(content: str) -> None:
+    write_validated_text(PROFILE_PATH, content, kind="configuration file")
+    protect_config_file(PROFILE_PATH)
 
 
 def build_env(
@@ -605,7 +617,7 @@ def write_files(env_content: str, profile_content: str) -> None:
     _write_env(env_content)
     ok(f"Записан {bold('.env')}")
 
-    PROFILE_PATH.write_text(profile_content, encoding="utf-8")
+    _write_profile(profile_content)
     ok(f"Записан {bold('profile.yaml')}")
 
 
@@ -632,8 +644,11 @@ def run_check_config() -> bool:
             for line in result.stderr.strip().splitlines():
                 print(f"    {red(line)}")
             return False
-    except Exception as e:
-        err(f"Не удалось запустить проверку: {e}")
+    except Exception as exc:
+        err(
+            "Не удалось запустить проверку: "
+            f"{safe_exception_message(exc, operation='config_check')}"
+        )
         return False
 
 
@@ -642,11 +657,12 @@ def run_check_config() -> bool:
 # ---------------------------------------------------------------------------
 
 def load_existing_env() -> dict[str, str]:
-    """Прочитать существующий .env файл."""
-    if not ENV_PATH.exists():
+    """Прочитать существующий .env файл через проверенный handle."""
+    content = read_validated_text(ENV_PATH, kind="configuration file")
+    if content is None:
         return {}
     result: dict[str, str] = {}
-    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+    for line in content.splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, _, value = line.partition("=")
@@ -655,12 +671,13 @@ def load_existing_env() -> dict[str, str]:
 
 
 def load_existing_profile() -> dict:
-    """Прочитать существующий profile.yaml."""
-    if not PROFILE_PATH.exists():
+    """Прочитать существующий profile.yaml через проверенный handle."""
+    content = read_validated_text(PROFILE_PATH, kind="configuration file")
+    if content is None:
         return {}
     try:
         import yaml
-        return yaml.safe_load(PROFILE_PATH.read_text(encoding="utf-8")) or {}
+        return yaml.safe_load(content) or {}
     except Exception:
         return {}
 
@@ -673,8 +690,8 @@ def show_current_config(env: dict[str, str], profile: dict) -> None:
     tg_token = env.get("TG_BOT_TOKEN", "")
     tg_user = env.get("TG_USER_ID", "")
     if tg_token:
-        masked = tg_token[:8] + "..." if len(tg_token) > 8 else tg_token
-        ok(f"Telegram: токен={masked}, User ID={tg_user}")
+        # Never display even a prefix of a token: it is still secret data.
+        ok(f"Telegram: токен настроен, User ID={tg_user}")
     else:
         err("Telegram: не настроен")
 
@@ -849,7 +866,7 @@ def wizard_edit(existing_env: dict[str, str], existing_profile: dict) -> None:
                     "github_url": existing_profile.get("candidate", {}).get("github_url", ""),
                 }
             profile_content = build_profile(required, optional)
-            PROFILE_PATH.write_text(profile_content, encoding="utf-8")
+            _write_profile(profile_content)
             ok(f"Профиль сохранён в {bold('profile.yaml')}")
 
         elif choice == 3:

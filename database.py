@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -9,8 +10,18 @@ from datetime import UTC, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import parse_qs, urlsplit
 
 from config import CandidateProfile, HHProfile, Profile
+from security_utils import (
+    FilesystemProtectionError,
+    open_validated_file,
+    protect_database,
+    protect_sqlite_siblings,
+    resolve_sqlite_target,
+    validate_path_before_io,
+    validate_sqlite_target,
+)
 
 
 class VacancyStatus(str, Enum):
@@ -265,15 +276,98 @@ def _positive_sqlite_id(value: object) -> int | None:
 class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self._sqlite_target = resolve_sqlite_target(path)
+        self._directory_protected = False
+
+    def _validate_sqlite_path(self) -> None:
+        """Re-check the target immediately before every SQLite connection."""
+        validate_sqlite_target(self._sqlite_target)
+
+    def _protect_storage(self) -> None:
+        """Restrict the database directory before SQLite creates files."""
+        if self._directory_protected:
+            return
+        protect_database(self._sqlite_target)
+        self._directory_protected = True
+
+    def _protect_database_file(self) -> None:
+        path = self._sqlite_target.path
+        if path is None:
+            return
+        # Re-check immediately before stat(), then protect the main database and
+        # every existing -journal/-wal/-shm/-sqlite/-tmp sibling.  Files created
+        # by a previous connection may only appear after that connection closed.
+        validate_path_before_io(path, kind="SQLite path")
+        if path.exists():
+            protect_sqlite_siblings(path)
+
+    def _sqlite_guard_mode(self) -> str | None:
+        """Mode for the handle kept open while SQLite resolves the path."""
+        target = self._sqlite_target
+        if target.path is None:
+            return None
+        if not target.uri:
+            return "a+b"
+        query = parse_qs(urlsplit(target.connect_name).query, keep_blank_values=True)
+        mode = "".join(query.get("mode", ())).casefold()
+        if mode == "ro":
+            return "rb"
+        if mode == "rw":
+            return "r+b"
+        return "a+b"
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        self._validate_sqlite_path()
+        self._protect_storage()
+
+        # Keep a verified handle on the database object while sqlite3 opens the
+        # path.  On Windows the no-DELETE share blocks rename/replace; on POSIX
+        # the inode is compared with the path after the connection is opened.
+        guard = None
+        guard_identity: tuple[int, int] | None = None
+        guard_mode = self._sqlite_guard_mode()
+        if guard_mode is not None and self._sqlite_target.path is not None:
+            guard = open_validated_file(
+                self._sqlite_target.path, guard_mode, kind="SQLite database"
+            )
+            info = os.fstat(guard.fileno())
+            guard_identity = (info.st_dev, info.st_ino)
+
+        connection: sqlite3.Connection | None = None
+        try:
+            # Directory creation/enumeration happened above; validate once more
+            # immediately before SQLite resolves the path and opens the file.
+            self._validate_sqlite_path()
+            if self._sqlite_target.uri:
+                connection = sqlite3.connect(
+                    self._sqlite_target.connect_name, timeout=10, uri=True
+                )
+            else:
+                connection = sqlite3.connect(
+                    self._sqlite_target.connect_name, timeout=10
+                )
+            self._protect_database_file()
+
+            if guard_identity is not None and self._sqlite_target.path is not None:
+                current = os.lstat(self._sqlite_target.path)
+                if guard_identity != (current.st_dev, current.st_ino):
+                    raise FilesystemProtectionError(
+                        "SQLite database was replaced during connect"
+                    )
+
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            return connection
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            raise
+        finally:
+            if guard is not None:
+                guard.close()
 
     def init(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._protect_storage()
         statuses = ", ".join(f"\'" + status.value + "\'" for status in VacancyStatus)
         with self._connect() as connection:
             connection.execute(
@@ -2240,17 +2334,31 @@ class Database:
     def skip(self, job_id: str, telegram_user_id: int, expected_user_id: int) -> bool:
         if telegram_user_id != expected_user_id:
             return False
-            if row["telegram_user_id"] is not None and row["telegram_user_id"] != telegram_user_id:
-                return None
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, telegram_user_id FROM vacancies WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None or row["status"] != VacancyStatus.PENDING_APPROVAL.value:
+                return False
+            if (
+                row["telegram_user_id"] is not None
+                and row["telegram_user_id"] != telegram_user_id
+            ):
+                return False
             cursor = connection.execute(
-                "UPDATE vacancies SET status = ?, approver_id = ? WHERE id = ? AND status = ?",
+                """
+                UPDATE vacancies SET status = ?, approver_id = ?
+                WHERE id = ? AND status = ?
+                  AND (telegram_user_id = ? OR telegram_user_id IS NULL)
+                """,
                 (
                     VacancyStatus.SKIPPED.value,
                     telegram_user_id,
                     job_id,
                     VacancyStatus.PENDING_APPROVAL.value,
+                    telegram_user_id,
                 ),
             )
             return cursor.rowcount == 1

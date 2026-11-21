@@ -300,7 +300,9 @@ def test_page_creation_failure_reports_network_error(tmp_path: Path) -> None:
     result = asyncio.run(client.read_vacancy(summary))
 
     assert result.state is PageState.NETWORK_ERROR
-    assert "page creation failed" in result.error
+    assert "vacancy_read_failed" in result.error
+    assert "RuntimeError" in result.error
+    assert "page creation failed" not in result.error
 
 
 def test_search_page_creation_failure_returns_safe_error(tmp_path: Path) -> None:
@@ -1343,11 +1345,17 @@ class LogoutContext(FakeContext):
         # calls it, this flag makes the regression visible in tests.
         self.legacy_storage_calls += 1
 
-    async def _evaluate(self, script: str) -> None:
+    async def _evaluate(self, script: str) -> dict[str, bool]:
         if self.fail_storage:
             raise RuntimeError("storage is locked")
         self.storage_script = script
         self.storage_cleared = True
+        return {
+            "dom_storage": True,
+            "indexeddb": True,
+            "cachestorage": True,
+            "service_worker": True,
+        }
 
 
 class FailingLogoutContext(LogoutContext):
@@ -1613,9 +1621,11 @@ def test_logout_confirmed_clears_session_and_persists_logged_out(
     assert context.cookies_cleared is True
     assert context.storage_cleared is True
     assert "https://hh.kz/" in context.goto_urls
-    assert context.storage_script == (
-        "localStorage.clear(); sessionStorage.clear();"
-    )
+    assert "localStorage.clear();" in context.storage_script
+    assert "sessionStorage.clear();" in context.storage_script
+    assert "indexedDB.deleteDatabase" in context.storage_script
+    assert "caches.keys" in context.storage_script
+    assert "getRegistrations" in context.storage_script
     assert context.legacy_storage_calls == 0
     stored = database.get_hh_account_model(42)
     assert stored is not None

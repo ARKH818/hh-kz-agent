@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from config import Settings
+from logging_setup import safe_exception_message
+from security_utils import ensure_validated_directory, protect_browser_profile
 
 
 Launcher = Callable[..., Awaitable[Any]]
@@ -12,6 +14,17 @@ Launcher = Callable[..., Awaitable[Any]]
 
 class BrowserLaunchError(RuntimeError):
     pass
+
+
+def _launch_error(backend: str, exc: BaseException) -> BrowserLaunchError:
+    """Build a launch error without copying a raw browser exception."""
+    detail = safe_exception_message(exc, operation=f"{backend}_start")
+    hint = (
+        " Set BROWSER_BACKEND=playwright to use the Playwright backend."
+        if backend == "CloakBrowser"
+        else ""
+    )
+    return BrowserLaunchError(f"{backend} failed to start: {detail}.{hint}")
 
 
 class BrowserBackend(Protocol):
@@ -39,7 +52,12 @@ class CloakBrowserBackend:
             return self._context
 
         try:
-            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            # Each component is validated before it is created, and the final
+            # path is checked again before the browser is launched.
+            profile_dir = ensure_validated_directory(
+                self.profile_dir, kind="browser profile"
+            )
+            protect_browser_profile(profile_dir)
 
             if self._launcher is None:
                 from cloakbrowser import launch_persistent_context_async
@@ -49,7 +67,7 @@ class CloakBrowserBackend:
                 launcher = self._launcher
 
             context = await launcher(
-                str(self.profile_dir),
+                str(profile_dir),
                 headless=self.headless,
             )
 
@@ -62,11 +80,7 @@ class CloakBrowserBackend:
 
         except Exception as exc:
             self._context = None
-            raise BrowserLaunchError(
-                "CloakBrowser failed to start: "
-                f"{exc}. "
-                "Set BROWSER_BACKEND=playwright to use the Playwright backend."
-            ) from exc
+            raise _launch_error("CloakBrowser", exc) from exc
 
     async def close(self) -> None:
         context = self._context
@@ -117,12 +131,17 @@ class PlaywrightBrowserBackend:
             return self._context
 
         try:
-            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            # Each component is validated before it is created, and the final
+            # path is checked again before the browser is launched.
+            profile_dir = ensure_validated_directory(
+                self.profile_dir, kind="browser profile"
+            )
+            protect_browser_profile(profile_dir)
 
             launcher = self._launcher or self._launch
 
             self._context = await launcher(
-                self.profile_dir,
+                profile_dir,
                 headless=self.headless,
             )
 
@@ -132,9 +151,7 @@ class PlaywrightBrowserBackend:
             return self._context
 
         except Exception as exc:
-            raise BrowserLaunchError(
-                f"Playwright failed to start: {exc}"
-            ) from exc
+            raise _launch_error("Playwright", exc) from exc
 
     async def close(self) -> None:
         context = self._context

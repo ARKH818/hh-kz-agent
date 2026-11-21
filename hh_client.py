@@ -6,7 +6,7 @@ import logging
 import random
 import re
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -18,6 +18,7 @@ from uuid import uuid4
 from approval import ApplicationPermission, ApprovalGuard
 from config import Settings, UserSettings, load_user_settings
 from database import Database, HHAccount, HHAccountStatus, VacancyStatus
+from logging_setup import safe_exception_message
 from runtime_context import HHAccountOwnershipError, verify_hh_account_ownership
 from vacancy_filter import is_relevant_logistics_title
 
@@ -154,6 +155,92 @@ class LogoutResult:
     ok: bool
     state: LoginState
     reason: str
+
+
+_SESSION_CLEANUP_COMPONENTS = (
+    "dom_storage",
+    "indexeddb",
+    "cachestorage",
+    "service_worker",
+)
+
+# Executed only on a verified https://hh.kz origin.  Each step reports its
+# own outcome so a partial failure can never be reported as a clean logout.
+_SESSION_CLEANUP_SCRIPT = """
+(async () => {
+  const result = {
+    dom_storage: false,
+    indexeddb: false,
+    cachestorage: false,
+    service_worker: false
+  };
+  try {
+    localStorage.clear();
+    sessionStorage.clear();
+    result.dom_storage = true;
+  } catch (error) {}
+  try {
+    const databases = await indexedDB.databases();
+    await Promise.all(databases.map((info) => new Promise((resolve, reject) => {
+      const request = indexedDB.deleteDatabase(info.name);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error("blocked"));
+    })));
+    result.indexeddb = true;
+  } catch (error) {}
+  try {
+    const keys = await caches.keys();
+    const deleted = await Promise.all(keys.map((key) => caches.delete(key)));
+    // CacheStorage.delete() resolves false when the cache still exists.
+    result.cachestorage = deleted.every((ok) => ok === true);
+  } catch (error) {}
+  try {
+    if (navigator.serviceWorker) {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      const unregistered = await Promise.all(
+        registrations.map((item) => item.unregister())
+      );
+      // A false result means the registration was not removed.
+      result.service_worker = unregistered.every((ok) => ok === true);
+    } else {
+      result.service_worker = true;
+    }
+  } catch (error) {}
+  return result;
+})()
+"""
+
+
+@dataclass(frozen=True)
+class SessionCleanupReport:
+    """Per-component result of an HH-origin session data cleanup."""
+
+    cookies: bool
+    dom_storage: bool
+    indexeddb: bool
+    cachestorage: bool
+    service_worker: bool
+
+    @property
+    def ok(self) -> bool:
+        return all(
+            (
+                self.cookies,
+                self.dom_storage,
+                self.indexeddb,
+                self.cachestorage,
+                self.service_worker,
+            )
+        )
+
+    @property
+    def failed(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in _SESSION_CLEANUP_COMPONENTS
+            if not getattr(self, name)
+        ) + (() if self.cookies else ("cookies",))
 
 
 def _utc_iso(value: datetime) -> str:
@@ -881,17 +968,17 @@ class HHClient:
         async with self.session_lock:
             return await self._check_session_unlocked()
 
-    async def _invalidate_session_unlocked(self) -> bool:
+    async def _invalidate_session_unlocked(self) -> SessionCleanupReport:
         """Clear THIS account's local HH session data.
 
-        Caller MUST hold ``session_lock``.  Playwright's BrowserContext has
-        ``clear_cookies()`` but no ``clear_storage_state()``; DOM storage is
-        cleared by evaluating on a page that has first navigated to the
-        HH.kz origin.  ``localStorage`` is never touched on ``about:blank``.
+        Caller MUST hold ``session_lock``.  Every cleanup API is executed on
+        a page that has first navigated to the verified HH.kz origin; DOM
+        storage is never touched on ``about:blank``.  Each component reports
+        its own result so partial failures remain visible.
         """
         context = self.context
         if context is None:
-            return False
+            return SessionCleanupReport(False, False, False, False, False)
 
         cookies_cleared = False
         clear_cookies = getattr(context, "clear_cookies", None)
@@ -907,7 +994,7 @@ class HHClient:
                     type(exc).__name__,
                 )
 
-        storage_cleared = False
+        cleanup_values = {name: False for name in _SESSION_CLEANUP_COMPONENTS}
         page = None
         try:
             page = await context.new_page()
@@ -921,12 +1008,15 @@ class HHClient:
             evaluate = getattr(page, "evaluate", None)
             if not callable(evaluate):
                 raise RuntimeError("page.evaluate is unavailable")
-            result = evaluate(
-                "localStorage.clear(); sessionStorage.clear();"
-            )
+            result = evaluate(_SESSION_CLEANUP_SCRIPT)
             if inspect.isawaitable(result):
-                await result
-            storage_cleared = True
+                result = await result
+            if not isinstance(result, Mapping):
+                raise TypeError("session cleanup result is not a mapping")
+            cleanup_values = {
+                name: bool(result.get(name, False))
+                for name in _SESSION_CLEANUP_COMPONENTS
+            }
         except Exception as exc:
             logger.warning(
                 "hh_logout_storage_clear_failed error=%s",
@@ -941,7 +1031,13 @@ class HHClient:
                         "hh_logout_page_close_failed error=%s",
                         type(exc).__name__,
                     )
-        return cookies_cleared and storage_cleared
+        return SessionCleanupReport(
+            cookies=cookies_cleared,
+            dom_storage=cleanup_values["dom_storage"],
+            indexeddb=cleanup_values["indexeddb"],
+            cachestorage=cleanup_values["cachestorage"],
+            service_worker=cleanup_values["service_worker"],
+        )
 
     async def logout(self) -> LogoutResult:
         """Log out THIS verified HH account and persist the outcome."""
@@ -961,7 +1057,12 @@ class HHClient:
                     False, LoginState.CHECK_FAILED, "ownership"
                 )
 
-            if not await self._invalidate_session_unlocked():
+            cleanup = await self._invalidate_session_unlocked()
+            if not cleanup.ok:
+                logger.warning(
+                    "hh_logout_incomplete components=%s",
+                    ",".join(cleanup.failed),
+                )
                 # Go through the central persistence path so an already
                 # explicit logout is not downgraded to CHECK_FAILED.
                 self._persist_check_result(LoginState.CHECK_FAILED)
@@ -1060,7 +1161,11 @@ class HHClient:
                 await self._delay()
             return VacancySearchResult(results, found_results, duplicates)
         except Exception as exc:
-            logger.error("vacancy_search_failed query=%r error=%s", query, exc)
+            logger.error(
+                "vacancy_search_failed query=%r %s",
+                query,
+                safe_exception_message(exc, operation="vacancy_search"),
+            )
             return VacancySearchResult(
                 results,
                 found_results,
@@ -1154,7 +1259,7 @@ class HHClient:
             return VacancyDetails(
                 summary,
                 PageState.NETWORK_ERROR,
-                error=f"{type(exc).__name__}: {exc}",
+                error=safe_exception_message(exc, operation="vacancy_read"),
             )
         finally:
             if page is not None:
@@ -1164,7 +1269,7 @@ class HHClient:
                     logger.warning(
                         "vacancy_page_close_failed job_id=%s error=%s",
                         summary.id,
-                        exc,
+                        type(exc).__name__,
                     )
 
     async def read_company_details(self, company_url: str) -> CompanyDetails:
@@ -1239,6 +1344,15 @@ class HHClient:
 
     async def submit_application(self, permission: ApplicationPermission) -> bool:
         """Serialised submit: check and physical send share ONE lock."""
+        # Fail closed before touching the session if a permit was minted for a
+        # different Telegram user.  This prevents another user's approval flow
+        # from driving this client's authenticated HH session.
+        if permission.telegram_user_id != self.telegram_user_id:
+            logger.warning(
+                "application_blocked job_id=%s reason=user_mismatch",
+                permission.job_id,
+            )
+            return False
         async with self.session_lock:
             return await self._submit_application_unlocked(permission)
 
@@ -1404,7 +1518,7 @@ class HHClient:
                 permission.permit,
                 success=False,
                 now=self.now_factory(),
-                error_text=str(exc),
+                error_text=safe_exception_message(exc, operation="application_submit"),
             )
 
             if not completed:

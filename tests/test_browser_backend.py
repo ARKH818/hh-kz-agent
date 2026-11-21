@@ -192,7 +192,8 @@ def test_cloakbrowser_launch_error_is_actionable(tmp_path: Path) -> None:
     message = str(raised.value)
     assert "CloakBrowser failed to start" in message
     assert "BROWSER_BACKEND=playwright" in message
-    assert "binary blocked" in message
+    assert "error_type=RuntimeError" in message
+    assert "binary blocked" not in message
 
 
 def test_browser_backends_do_not_receive_approval_state(tmp_path: Path) -> None:

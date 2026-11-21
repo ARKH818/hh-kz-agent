@@ -7,6 +7,7 @@ from typing import Any
 
 import aiohttp
 
+from logging_setup import safe_exception_message
 from version import __version__, is_newer_version
 
 logger = logging.getLogger(__name__)
@@ -61,10 +62,16 @@ async def check_github_release(
                 body=str(data.get("body", "")).strip(),
             )
     except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
-        logger.debug("github_release_check_failed error=%s", exc)
+        logger.debug(
+            "github_release_check_failed %s",
+            safe_exception_message(exc, operation="release_check"),
+        )
         return None
     except Exception as exc:
-        logger.warning("github_release_check_unexpected_error error=%s", exc)
+        logger.warning(
+            "github_release_check_unexpected_error %s",
+            safe_exception_message(exc, operation="release_check"),
+        )
         return None
     finally:
         if owns_session:

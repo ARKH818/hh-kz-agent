@@ -31,6 +31,7 @@ from approval import ApprovalService
 from config import Settings
 from database import Database, HHAccountStatus, Vacancy
 from hh_client import HHClient, LoginState
+from logging_setup import safe_exception_message
 from runtime_context import UserRuntimeContext
 from updater import ReleaseInfo, check_github_release
 from version import __version__
@@ -400,8 +401,25 @@ class TelegramService:
         await message.answer(await self.command_async(name, user_id))
 
     async def _callback_handler(self, callback: CallbackQuery) -> None:
-        if not self.authorized(callback.from_user.id):
+        user_id = callback.from_user.id
+        if not self.authorized(user_id):
             await self._answer_callback(callback, PRIVATE_REPLY, show_alert=True)
+            return
+        # An approval callback must reach the same user's runtime and HH
+        # session.  Checking only database membership would let a different
+        # active user drive this process's fixed approval service/sender.
+        client = self._hh_client_for(user_id)
+        sender = getattr(self.approval_service, "sender", None)
+        if (
+            self._runtime_context(user_id) is None
+            or client is None
+            or (
+                sender is not client
+                and getattr(sender, "telegram_user_id", None) != user_id
+            )
+        ):
+            logger.error("approval_callback_identity_rejected user=%s", user_id)
+            await self._answer_callback(callback, NO_RUNTIME_REPLY, show_alert=True)
             return
         action, separator, job_id = (callback.data or "").partition(":")
         if len((callback.data or "").encode()) > 64:
@@ -416,25 +434,23 @@ class TelegramService:
             return
         if action == "apply":
             await callback.answer("⏳ Отправляем отклик...", show_alert=False)
-            result = await self.approval_service.approve_and_apply(
-                job_id, callback.from_user.id
-            )
-            vacancy = self.database.get(job_id, telegram_user_id=callback.from_user.id)
+            result = await self.approval_service.approve_and_apply(job_id, user_id)
+            vacancy = self.database.get(job_id, telegram_user_id=user_id)
             if result.ok:
-                await self.notify("✓ Отклик отправлен", callback.from_user.id)
+                await self.notify("✓ Отклик отправлен", user_id)
                 if callback.message:
                     await callback.message.edit_reply_markup(reply_markup=None)
             else:
                 if vacancy and vacancy.error_text == "questionnaire_required":
                     await self.notify_questionnaire_required(
-                        vacancy.title, vacancy.url, callback.from_user.id
+                        vacancy.title, vacancy.url, user_id
                     )
                     if callback.message:
                         await callback.message.edit_reply_markup(reply_markup=None)
                 else:
-                    await self.notify(f"✗ {result.message}", callback.from_user.id)
+                    await self.notify(f"✗ {result.message}", user_id)
         else:
-            result = self.approval_service.skip(job_id, callback.from_user.id)
+            result = self.approval_service.skip(job_id, user_id)
             await self._answer_callback(
                 callback, result.message, show_alert=not result.ok
             )
@@ -576,7 +592,10 @@ class TelegramService:
         try:
             await self.bot.send_message(chat_id=target_user_id, text=text)
         except Exception as exc:
-            logger.warning("telegram_notify_failed error=%s", exc)
+            logger.warning(
+                "telegram_notify_failed %s",
+                safe_exception_message(exc, operation="telegram_notify"),
+            )
 
     async def notify_questionnaire_required(
         self, title: str, url: str, *, telegram_user_id: int
@@ -596,7 +615,10 @@ class TelegramService:
                 disable_web_page_preview=True,
             )
         except Exception as exc:
-            logger.warning("notify_questionnaire_failed error=%s", exc)
+            logger.warning(
+                "notify_questionnaire_failed %s",
+                safe_exception_message(exc, operation="questionnaire_notify"),
+            )
 
     async def request_captcha(
         self, screenshot: Path, title: str, timeout_seconds: int, *, telegram_user_id: int
@@ -624,7 +646,10 @@ class TelegramService:
         try:
             release = await check_github_release(current_version=__version__)
         except Exception as exc:
-            logger.debug("update_check_failed error=%s", exc)
+            logger.debug(
+                "update_check_failed %s",
+                safe_exception_message(exc, operation="update_check"),
+            )
             return None
         if release is not None:
             self.latest_release = release
@@ -650,7 +675,10 @@ class TelegramService:
                 disable_web_page_preview=True,
             )
         except Exception as exc:
-            logger.warning("notify_update_available_failed error=%s", exc)
+            logger.warning(
+                "notify_update_available_failed %s",
+                safe_exception_message(exc, operation="update_notify"),
+            )
 
     async def start_polling(self) -> None:
         while True:
@@ -660,7 +688,10 @@ class TelegramService:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.warning("telegram_polling_error error=%s, retrying in 5s", exc)
+                logger.warning(
+                    "telegram_polling_error %s, retrying in 5s",
+                    safe_exception_message(exc, operation="telegram_polling"),
+                )
                 await asyncio.sleep(5)
 
     async def stop(self) -> None:

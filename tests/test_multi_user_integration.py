@@ -1838,9 +1838,15 @@ class _Phase56LogoutContext(FakeContext):
     async def clear_storage_state(self) -> None:
         self.legacy_storage_calls += 1
 
-    async def _evaluate(self, script: str) -> None:
+    async def _evaluate(self, script: str) -> dict[str, bool]:
         self.storage_script = script
         self.storage_cleared = True
+        return {
+            "dom_storage": True,
+            "indexeddb": True,
+            "cachestorage": True,
+            "service_worker": True,
+        }
 
 
 class _Phase56TelegramClient:
